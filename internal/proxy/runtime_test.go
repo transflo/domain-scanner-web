@@ -341,3 +341,62 @@ func TestTestConfigReportsStartFailureAndBadJSON(t *testing.T) {
 		t.Fatalf("bad json: %+v", r)
 	}
 }
+
+const xrayDialError = "2026/10/02 18:30:40.858353 [Error] [3871167151] transport/internet/websocket: failed to dial to e2e-import.invalid:443 > dial tcp: lookup e2e-import.invalid on 127.0.0.11:53: no such host"
+
+func TestReasonForReportsWhatXrayLoggedAboutTheHost(t *testing.T) {
+	m, _ := newManager(t)
+	since := time.Now().Add(-time.Second)
+	m.logf("info", xrayDialError)
+	m.logf("info", "2026/10/02 18:30:41.000000 [Error] [1] transport/internet/tcp: failed to dial to other.example:443 > dial tcp: i/o timeout")
+	m.logf("info", "2026/10/02 18:30:41.100000 [Info] app/proxyman: accepted something")
+
+	got := m.reasonFor("e2e-import.invalid", since)
+	if !strings.Contains(got, "no such host") || !strings.Contains(got, "e2e-import.invalid") {
+		t.Fatalf("reason = %q", got)
+	}
+	for _, noise := range []string{"[Error]", "3871167151", "2026/10/02", "transport/internet/websocket"} {
+		if strings.Contains(got, noise) {
+			t.Fatalf("reason %q still contains %q", got, noise)
+		}
+	}
+	if strings.Contains(got, "i/o timeout") {
+		t.Fatalf("reason %q leaked another host's error", got)
+	}
+	if m.reasonFor("never-seen.example", since) != "" {
+		t.Fatal("no log line mentions this host; there must be no reason")
+	}
+	if m.reasonFor("e2e-import.invalid", time.Now().Add(time.Minute)) != "" {
+		t.Fatal("errors older than the probe must not be blamed on it")
+	}
+}
+
+func TestExplainKeepsTheProbeErrorAndAddsXraysReason(t *testing.T) {
+	m, _ := newManager(t)
+	since := time.Now().Add(-time.Second)
+	m.logf("info", xrayDialError)
+	r := m.explain(ProbeResult{Error: "read tcp 127.0.0.1:1->127.0.0.1:2: connection reset by peer"}, "e2e-import.invalid", since)
+	if !strings.Contains(r.Error, "no such host") || !strings.Contains(r.Error, "connection reset by peer") {
+		t.Fatalf("error = %q", r.Error)
+	}
+	ok := ProbeResult{OK: true, DelayMS: 5}
+	if got := m.explain(ok, "e2e-import.invalid", since); got != ok {
+		t.Fatalf("a passing probe must not change: %+v", got)
+	}
+	if got := m.explain(ProbeResult{Error: "boom"}, "other.example", since); got.Error != "boom" {
+		t.Fatalf("no matching xray line: error must stay as is, got %q", got.Error)
+	}
+}
+
+func TestRecentErrorsAreBounded(t *testing.T) {
+	m, _ := newManager(t)
+	for i := 0; i < 5000; i++ {
+		m.logf("info", "2026/10/02 18:30:40.000000 [Error] [1] x: failed to dial to h"+strconv.Itoa(i)+".example:443 > boom")
+	}
+	m.xerrMu.Lock()
+	n := len(m.xerrs)
+	m.xerrMu.Unlock()
+	if n > 200 {
+		t.Fatalf("ring holds %d lines", n)
+	}
+}

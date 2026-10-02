@@ -159,6 +159,9 @@ type Manager struct {
 	cancel  context.CancelFunc
 	ports   map[int64]int
 	lastErr string
+
+	xerrMu sync.Mutex
+	xerrs  []xrayErr
 }
 
 func NewManager(bin, dir string, lg *logbus.Logger) *Manager {
@@ -200,6 +203,7 @@ func (m *Manager) logf(level, line string) {
 	lv := level
 	if strings.Contains(line, "[Error]") {
 		lv = "error"
+		m.noteError(line)
 	} else if strings.Contains(line, "[Warning]") {
 		lv = "warn"
 	} else if strings.Contains(line, "[Info]") || strings.Contains(line, "[Debug]") {
@@ -449,7 +453,12 @@ func (m *Manager) TestConfig(ctx context.Context, cfg json.RawMessage, o ProbeOp
 	if err := waitReady(pctx, []int{port}, readyTimeout); err != nil {
 		return ProbeResult{Error: "xray 未能启动(配置可能被 xray 拒绝,见日志组件 xray):" + err.Error()}
 	}
-	return Probe(pctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), o)
+	started := time.Now()
+	res := Probe(pctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), o)
+	if imp, err := Validate(cfg); err == nil {
+		res = m.explain(res, imp.Address, started)
+	}
+	return res
 }
 
 // ---- real process ----

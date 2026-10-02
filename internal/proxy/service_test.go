@@ -174,3 +174,36 @@ func TestStatusListsEgresses(t *testing.T) {
 		t.Fatalf("status = %+v", st)
 	}
 }
+
+func TestFailedTestsCarryXraysReasonForThatOutbound(t *testing.T) {
+	e := newSvc(t)
+	a := e.add(t, "one", true)
+	e.svc.Reload(context.Background())
+	e.svc.TestURL = func() string { return "http://127.0.0.1:1/dead" }
+	host := "a.example" // the address in vlessCfg
+	// xray logs the dial failure while the probe runs
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				e.svc.Mgr.logf("info", "2026/10/02 18:30:40.858353 [Error] [1] transport/internet/tcp: failed to dial to "+host+":443 > dial tcp: lookup "+host+": no such host")
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	}()
+	defer close(done)
+	res, err := e.svc.TestOne(context.Background(), a)
+	if err != nil || res.OK {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if !strings.Contains(res.Error, "no such host") {
+		t.Fatalf("error %q lacks xray's reason", res.Error)
+	}
+	o, _ := e.st.GetOutbound(context.Background(), a)
+	if !strings.Contains(o.LastError, "no such host") {
+		t.Fatalf("stored error %q lacks xray's reason", o.LastError)
+	}
+}

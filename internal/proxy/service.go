@@ -126,8 +126,9 @@ func (s *Service) TestOne(ctx context.Context, id int64) (ProbeResult, error) {
 	}
 	opts := s.probeOptions()
 	var res ProbeResult
+	started := time.Now()
 	if port, ok := s.Mgr.Port(id); ok && o.Enabled {
-		res = Probe(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), opts)
+		res = s.Mgr.explain(Probe(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), opts), o.Address, started)
 	} else {
 		res = s.Mgr.TestConfig(ctx, o.Config, opts)
 	}
