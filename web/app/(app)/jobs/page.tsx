@@ -169,7 +169,9 @@ export default function JobsPage() {
                         {j.wordlist
                           ? `词库 ${j.wordlist}`
                           : `${j.pattern === "d" ? "数字" : j.pattern === "D" ? "字母" : "字母数字"} × ${j.length}`}
-                        {j.regex && ` · /${j.regex}/`} · {j.workers} 并发 · {j.delay_ms}ms
+                        {j.regex && ` · /${j.regex}/`} · {j.workers} 并发 · {j.delay_ms}ms ·{" "}
+                        {j.egress_mode === "proxy" ? `代理 #${j.proxy_id}` : j.egress_mode === "pool" ? "代理池" : "直连"}
+                        {j.failover ? "" : "(不切换)"}
                       </div>
                       {j.error && <div className="mt-1 text-xs text-destructive">{j.error}</div>}
                     </TableCell>

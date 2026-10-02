@@ -1,10 +1,19 @@
 import type {
+  Diagnostics,
+  EgressStatus,
+  ImportResult,
   Job,
   JobParams,
   LogEntry,
+  LogFilter,
+  Outbound,
+  OutboundDetail,
+  ProbeResult,
+  ProxyStatus,
   ResultFilter,
   ResultRow,
   Settings,
+  SettingsUpdate,
   Stats,
   WordlistInfo,
 } from "@/lib/types"
@@ -78,9 +87,28 @@ export const api = {
   exportUrl: (f: ResultFilter) => `/api/results/export${query({ ...f, limit: undefined, offset: undefined })}`,
 
   // logs
-  logs: (p: { level?: string; job_id?: number; limit?: number; before_id?: number }) =>
-    request<{ items: LogEntry[] }>(`/logs${query({ ...p })}`).then((r) => r.items),
-  streamUrl: (p: { level?: string; job_id?: number }) => `/api/logs/stream${query({ ...p })}`,
+  logs: (p: LogFilter) => request<{ items: LogEntry[] }>(`/logs${query({ ...p })}`).then((r) => r.items),
+  logComponents: () => request<{ items: string[] }>("/logs/components").then((r) => r.items),
+  streamUrl: (p: LogFilter) => `/api/logs/stream${query({ ...p, limit: undefined, before_id: undefined })}`,
+  logExportUrl: (p: LogFilter) => `/api/logs/export${query({ ...p, limit: undefined, before_id: undefined })}`,
+  diagnostics: (hours: number) => request<Diagnostics>(`/diagnostics${query({ hours })}`),
+
+  // outbound proxies
+  outbounds: () => request<{ items: Outbound[]; status: ProxyStatus }>("/outbounds"),
+  outbound: (id: number) => request<OutboundDetail>(`/outbounds/${id}`),
+  createOutbound: (b: { name?: string; config: string; enabled?: boolean }) =>
+    request<OutboundDetail>("/outbounds", json("POST", b)),
+  updateOutbound: (id: number, b: { name?: string; config?: string; enabled?: boolean }) =>
+    request<OutboundDetail>(`/outbounds/${id}`, json("PUT", b)),
+  deleteOutbound: (id: number) => request<void>(`/outbounds/${id}`, json("DELETE")),
+  importOutbounds: (text: string, save: boolean) =>
+    request<ImportResult>("/outbounds/import", json("POST", { text, save })),
+  testOutbound: (id: number) => request<ProbeResult>(`/outbounds/${id}/test`, json("POST")),
+  testAllOutbounds: () =>
+    request<{ results: Record<string, ProbeResult> }>("/outbounds/test-all", json("POST")).then((r) => r.results),
+  testOutboundConfig: (config: string) => request<ProbeResult>("/outbounds/test-config", json("POST", { config })),
+  reloadOutbounds: () => request<ProxyStatus>("/outbounds/reload", json("POST")),
+  egresses: () => request<{ items: EgressStatus[] }>("/egresses").then((r) => r.items),
 
   // wordlists
   wordlists: () => request<{ items: WordlistInfo[] }>("/wordlists").then((r) => r.items),
@@ -93,7 +121,7 @@ export const api = {
 
   // settings
   settings: () => request<Settings>("/settings"),
-  saveSettings: (s: { telegram_token?: string; telegram_chat_id?: string }) =>
-    request<Settings>("/settings", json("PUT", s)),
+  saveSettings: (s: SettingsUpdate) => request<Settings>("/settings", json("PUT", s)),
   testTelegram: () => request<{ ok: true }>("/settings/telegram/test", json("POST")),
+  testCloudflare: () => request<{ ok: true }>("/settings/cloudflare/test", json("POST")),
 }

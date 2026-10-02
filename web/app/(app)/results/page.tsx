@@ -29,6 +29,7 @@ import {
 import { usePoll } from "@/hooks/use-poll"
 import { api } from "@/lib/api"
 import { fmtNum, fmtTime } from "@/lib/format"
+import type { CFStatus, ResultRow } from "@/lib/types"
 
 const PAGE_SIZE = 50
 
@@ -37,6 +38,57 @@ const statusItems = [
   { value: "unknown", label: "无法确定" },
   { value: "all", label: "全部" },
 ]
+
+const cfItems = [
+  { value: "all", label: "Cloudflare:全部" },
+  { value: "confirmed", label: "已确认可注册" },
+  { value: "unsupported", label: "未经 CF 确认" },
+  { value: "rejected", label: "CF 判定不可注册" },
+  { value: "pending", label: "核查中" },
+  { value: "error", label: "核查失败" },
+]
+
+const cfLabel: Record<CFStatus, string> = {
+  "": "未核查",
+  pending: "核查中",
+  confirmed: "CF 已确认",
+  rejected: "CF 不可注册",
+  unsupported: "未经 CF 确认",
+  error: "核查失败",
+}
+
+const cfVariant: Record<CFStatus, React.ComponentProps<typeof Badge>["variant"]> = {
+  "": "outline",
+  pending: "outline",
+  confirmed: "default",
+  rejected: "destructive",
+  unsupported: "secondary",
+  error: "destructive",
+}
+
+const registerLabel: Record<string, string> = {
+  registering: "注册中…",
+  succeeded: "已注册",
+  failed: "注册失败",
+}
+
+function CFCell({ r }: { r: ResultRow }) {
+  return (
+    <div className="flex min-w-0 flex-col items-start gap-1" data-testid={`cf-${r.id}`}>
+      <Badge variant={cfVariant[r.cf_status]}>{cfLabel[r.cf_status]}</Badge>
+      {r.cf_status === "confirmed" && r.cf_price && (
+        <span className="text-xs tabular-nums text-muted-foreground">
+          {r.cf_price} {r.cf_currency}
+        </span>
+      )}
+      {r.cf_reason && r.cf_status !== "confirmed" && (
+        <span className="max-w-40 truncate text-xs text-muted-foreground" title={r.cf_reason}>
+          {r.cf_reason}
+        </span>
+      )}
+    </div>
+  )
+}
 
 async function copy(text: string, what: string) {
   try {
@@ -50,6 +102,7 @@ async function copy(text: string, what: string) {
 function ResultsView() {
   const params = useSearchParams()
   const [status, setStatus] = useState("available")
+  const [cf, setCf] = useState("all")
   const [jobId, setJobId] = useState(params.get("job") ?? "all")
   const [q, setQ] = useState("")
   const [debouncedQ, setDebouncedQ] = useState("")
@@ -75,6 +128,7 @@ function ResultsView() {
 
   const filter = {
     status: status === "all" ? undefined : status,
+    cf_status: cf === "all" ? undefined : cf,
     job_id: jobId === "all" ? undefined : Number(jobId),
     q: debouncedQ || undefined,
   }
@@ -92,7 +146,9 @@ function ResultsView() {
     <>
       <div>
         <h1 className="text-xl font-semibold">扫描结果</h1>
-        <p className="text-sm text-muted-foreground">默认只显示已确认可注册的域名。</p>
+        <p className="text-sm text-muted-foreground">
+          默认显示 RDAP/WHOIS 判定可注册的域名;Cloudflare 列是最终核查结果,只有「CF 已确认」的域名才会推送带注册按钮的 Telegram 消息。
+        </p>
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
@@ -106,8 +162,18 @@ function ResultsView() {
             ))}
           </SelectContent>
         </Select>
+        <Select value={cf} onValueChange={(v) => { setCf(String(v)); setPage(0) }} items={cfItems}>
+          <SelectTrigger aria-label="Cloudflare 筛选" className="w-44">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {cfItems.map((i) => (
+              <SelectItem key={i.value} value={i.value}>{i.label}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <Select value={jobId} onValueChange={(v) => { setJobId(String(v)); setPage(0) }} items={jobItems}>
-          <SelectTrigger aria-label="任务筛选" className="w-52">
+          <SelectTrigger aria-label="任务筛选" className="w-full sm:w-52">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -116,12 +182,12 @@ function ResultsView() {
             ))}
           </SelectContent>
         </Select>
-        <div className="relative">
+        <div className="relative w-full sm:w-auto">
           <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             aria-label="搜索域名"
             placeholder="搜索域名…"
-            className="w-48 pl-8"
+            className="w-full pl-8 sm:w-48"
             value={q}
             onChange={(e) => setQ(e.target.value)}
           />
@@ -163,6 +229,8 @@ function ResultsView() {
                 <TableRow>
                   <TableHead>域名</TableHead>
                   <TableHead>状态</TableHead>
+                  <TableHead>Cloudflare</TableHead>
+                  <TableHead>注册</TableHead>
                   <TableHead>任务</TableHead>
                   <TableHead>说明</TableHead>
                   <TableHead>发现时间</TableHead>
@@ -177,6 +245,18 @@ function ResultsView() {
                       <Badge variant={r.status === "available" ? "default" : "outline"}>
                         {r.status === "available" ? "可注册" : "无法确定"}
                       </Badge>
+                    </TableCell>
+                    <TableCell>
+                      <CFCell r={r} />
+                    </TableCell>
+                    <TableCell className="whitespace-nowrap text-xs" title={r.register_note}>
+                      {r.register_status ? (
+                        <Badge variant={r.register_status === "succeeded" ? "default" : r.register_status === "failed" ? "destructive" : "outline"}>
+                          {registerLabel[r.register_status] ?? r.register_status}
+                        </Badge>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
                     </TableCell>
                     <TableCell className="tabular-nums">#{r.job_id}</TableCell>
                     <TableCell className="max-w-72 truncate text-xs text-muted-foreground" title={r.signatures}>

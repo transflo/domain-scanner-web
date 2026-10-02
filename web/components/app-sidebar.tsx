@@ -7,6 +7,7 @@ import {
   LayoutDashboardIcon,
   ListChecksIcon,
   LogOutIcon,
+  NetworkIcon,
   RadarIcon,
   SettingsIcon,
   TableIcon,
@@ -22,6 +23,7 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
+  useSidebar,
 } from "@/components/ui/sidebar"
 import { Badge } from "@/components/ui/badge"
 import { useHealth } from "@/hooks/use-health"
@@ -31,6 +33,7 @@ const items = [
   { href: "/", label: "仪表盘", icon: LayoutDashboardIcon },
   { href: "/jobs", label: "扫描任务", icon: ListChecksIcon },
   { href: "/results", label: "扫描结果", icon: TableIcon },
+  { href: "/proxies", label: "出站代理", icon: NetworkIcon },
   { href: "/logs", label: "运行日志", icon: FileTextIcon },
   { href: "/settings", label: "设置", icon: SettingsIcon },
 ]
@@ -39,6 +42,7 @@ export function AppSidebar() {
   const pathname = usePathname()
   const router = useRouter()
   const { connected } = useHealth()
+  const { setOpenMobile } = useSidebar()
 
   async function logout() {
     try {
@@ -54,7 +58,7 @@ export function AppSidebar() {
       <SidebarHeader>
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton size="lg" render={<Link href="/" />}>
+            <SidebarMenuButton size="lg" render={<Link href="/" onClick={() => setOpenMobile(false)} />}>
               <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
                 <RadarIcon className="size-4" />
               </div>
@@ -77,7 +81,7 @@ export function AppSidebar() {
                     <SidebarMenuButton
                       isActive={active}
                       tooltip={item.label}
-                      render={<Link href={item.href} />}
+                      render={<Link href={item.href} onClick={() => setOpenMobile(false)} />}
                     >
                       <item.icon />
                       <span>{item.label}</span>

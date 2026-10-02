@@ -4,6 +4,7 @@ import { useRef, useState } from "react"
 import { UploadIcon } from "lucide-react"
 import { toast } from "sonner"
 
+import { SelectField } from "@/components/field"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -28,7 +29,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { usePoll } from "@/hooks/use-poll"
 import { api, ApiError } from "@/lib/api"
 import { estimateSpace, fmtNum } from "@/lib/format"
-import type { Job, JobParams } from "@/lib/types"
+import type { EgressMode, Job, JobParams } from "@/lib/types"
 
 const SOFT_LIMIT = 5_000_000
 
@@ -56,6 +57,9 @@ export function JobForm({ open, onOpenChange, onCreated }: Props) {
   const [delayMs, setDelayMs] = useState(500)
   const [useReserved, setUseReserved] = useState(false)
   const [force, setForce] = useState(false)
+  const [egressMode, setEgressMode] = useState<EgressMode>("direct")
+  const [proxyId, setProxyId] = useState("")
+  const [failover, setFailover] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const fileRef = useRef<HTMLInputElement>(null)
@@ -64,6 +68,13 @@ export function JobForm({ open, onOpenChange, onCreated }: Props) {
   const wordlistItems = (lists.data ?? []).map((w) => ({
     value: w.id,
     label: `${w.name}(${fmtNum(w.count)} 词${w.builtin ? ",内置" : ""})`,
+  }))
+
+  const proxies = usePoll(api.outbounds, 15_000, open ? "open" : "closed")
+  const usable = (proxies.data?.items ?? []).filter((o) => o.enabled)
+  const proxyItems = usable.map((o) => ({
+    value: String(o.id),
+    label: `${o.name}${o.last_test_at ? (o.last_ok ? `(${o.last_delay_ms}ms)` : "(不可用)") : ""}`,
   }))
 
   const space = mode === "pattern" ? estimateSpace(pattern, length) : null
@@ -96,7 +107,10 @@ export function JobForm({ open, onOpenChange, onCreated }: Props) {
       delay_ms: delayMs,
       use_reserved: useReserved,
       force,
+      egress_mode: egressMode,
+      failover,
     }
+    if (egressMode === "proxy") params.proxy_id = Number(proxyId)
     if (mode === "pattern") {
       params.pattern = pattern
       params.length = length
@@ -265,6 +279,45 @@ export function JobForm({ open, onOpenChange, onCreated }: Props) {
               </Label>
             </div>
 
+            <div className="flex flex-col gap-3 rounded-lg border p-3" data-testid="egress-section">
+              <SelectField
+                label="出站方式"
+                value={egressMode}
+                onChange={(v) => setEgressMode(v as EgressMode)}
+                options={[
+                  { value: "direct", label: "直连(本机网络)" },
+                  { value: "proxy", label: "指定代理" },
+                  { value: "pool", label: "代理池(任一可用代理)" },
+                ]}
+                hint={
+                  egressMode === "direct"
+                    ? "直连任务数量不受限制;出现大量错误时会自动退避,并切换到可用代理。"
+                    : egressMode === "pool"
+                      ? "在所有已启用且测活通过的代理中择优使用。"
+                      : "全部流量经所选代理发出。"
+                }
+              />
+              {egressMode === "proxy" && (
+                <SelectField
+                  label="代理"
+                  value={proxyId}
+                  onChange={setProxyId}
+                  options={proxyItems}
+                  placeholder={proxyItems.length ? "选择代理" : "还没有可用代理"}
+                  hint={proxyItems.length === 0 ? "请先到「出站代理」页添加并启用代理。" : undefined}
+                />
+              )}
+              <div className="flex items-start gap-2">
+                <Checkbox id="job-failover" checked={failover} onCheckedChange={(c) => setFailover(c === true)} className="mt-0.5" />
+                <Label htmlFor="job-failover" className="flex-col items-start gap-0.5 font-normal">
+                  <span>出错时自动切换</span>
+                  <span className="text-xs text-muted-foreground">
+                    当前出站持续报错(限流/超时/断连)时退避等待,并改用其它可用出站;恢复后自动切回。
+                  </span>
+                </Label>
+              </div>
+            </div>
+
             {error && (
               <Alert variant="destructive" role="alert">
                 <AlertDescription>{error}</AlertDescription>
@@ -273,7 +326,7 @@ export function JobForm({ open, onOpenChange, onCreated }: Props) {
           </div>
 
           <SheetFooter className="mt-4">
-            <Button type="submit" disabled={busy || (mode === "dictionary" && !wordlist) || (tooLarge && !force)}>
+            <Button type="submit" disabled={busy || (mode === "dictionary" && !wordlist) || (tooLarge && !force) || (egressMode === "proxy" && !proxyId)}>
               {busy ? "创建中…" : "创建并开始"}
             </Button>
           </SheetFooter>
