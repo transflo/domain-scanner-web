@@ -1,0 +1,7 @@
+# Development override: publish the scanner API on the loopback interface only, so the Next dev
+# server (pnpm dev, http://localhost:3000 by default) can proxy to http://localhost:8080.
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d scanner
+services:
+  scanner:
+    ports:
+      - "127.0.0.1:8080:8080"

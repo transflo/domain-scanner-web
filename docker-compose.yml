@@ -12,11 +12,25 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       MAX_PARALLEL_JOBS: ${MAX_PARALLEL_JOBS:-2}
+      # Extra "tld=https://rdap.example/" pairs, comma separated (see README).
+      RDAP_SERVERS: ${RDAP_SERVERS:-}
       # The only client of this port is the web container, which appends the real client IP.
       TRUST_PROXY: "true"
     volumes:
       - scanner-data:/data
     # No published ports: reach the API through the web container only.
+
+  web:
+    build:
+      context: ./web
+      args:
+        SCANNER_URL: http://scanner:8080
+    restart: unless-stopped
+    depends_on:
+      scanner:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-3000}:3000"
 
 volumes:
   scanner-data:

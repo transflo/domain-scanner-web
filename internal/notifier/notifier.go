@@ -285,6 +285,9 @@ func (n *Notifier) send(ctx context.Context, c Config, text string) error {
 			desc = desc[:200]
 		}
 	}
+	if strings.Contains(strings.ToLower(desc), "chat not found") {
+		desc += "(提示:请先在 Telegram 里打开这个机器人并点击 Start / 发送 /start,机器人才能给你发消息;也请核对 Chat ID)"
+	}
 	return &sendError{
 		msg:   logbus.RedactSecrets(fmt.Sprintf("Telegram API 错误 (HTTP %d): %s", resp.StatusCode, desc), c.Token),
 		retry: resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests,

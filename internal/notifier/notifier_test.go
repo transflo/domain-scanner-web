@@ -261,6 +261,10 @@ func TestSendTest(t *testing.T) {
 	if strings.Contains(err.Error(), "AAHdummy") {
 		t.Fatalf("token leaked in error: %v", err)
 	}
+	// the most common setup mistake deserves an actionable hint
+	if !strings.Contains(err.Error(), "/start") {
+		t.Fatalf("chat-not-found error should tell the user to press Start on the bot: %v", err)
+	}
 
 	n2, _ := setup(t, f, Options{FlushEvery: time.Hour}, Config{})
 	if err := n2.SendTest(context.Background()); err == nil {

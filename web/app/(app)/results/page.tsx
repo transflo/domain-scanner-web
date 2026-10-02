@@ -68,6 +68,10 @@ function ResultsView() {
     { value: "all", label: "全部任务" },
     ...(jobs.data ?? []).map((j) => ({ value: String(j.id), label: `#${j.id} ${j.name}` })),
   ]
+  // The job list loads asynchronously; until then label a preselected job (?job=N) as "#N".
+  if (jobId !== "all" && !jobItems.some((i) => i.value === jobId)) {
+    jobItems.push({ value: jobId, label: `#${jobId}` })
+  }
 
   const filter = {
     status: status === "all" ? undefined : status,

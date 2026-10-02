@@ -69,6 +69,9 @@ function LogView() {
     { value: "all", label: "全部任务" },
     ...(jobs.data ?? []).map((j) => ({ value: String(j.id), label: `#${j.id} ${j.name}` })),
   ]
+  if (jobId !== "all" && !jobItems.some((i) => i.value === jobId)) {
+    jobItems.push({ value: jobId, label: `#${jobId}` })
+  }
 
   // History first, then the live stream. Re-runs whenever a filter changes.
   useEffect(() => {

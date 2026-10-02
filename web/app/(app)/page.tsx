@@ -33,7 +33,7 @@ function StatCard({
   testId: string
 }) {
   return (
-    <Card size="sm">
+    <Card>
       <CardHeader>
         <CardDescription>{title}</CardDescription>
         <CardTitle className="text-2xl tabular-nums" data-testid={testId}>
@@ -78,7 +78,7 @@ export default function DashboardPage() {
           <CardTitle>最近任务</CardTitle>
           <CardDescription>最新创建的 6 个任务</CardDescription>
           <CardAction>
-            <Button variant="outline" size="sm" render={<Link href="/jobs" />}>
+            <Button variant="outline" size="sm" nativeButton={false} render={<Link href="/jobs" />}>
               全部任务 <ArrowRightIcon data-icon="inline-end" />
             </Button>
           </CardAction>
