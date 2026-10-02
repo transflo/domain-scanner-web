@@ -298,17 +298,26 @@ func (s *Store) InsertLogs(ctx context.Context, entries []LogEntry) error {
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO logs (job_id,level,message,time) VALUES (?,?,?,?)`)
+	// A non-zero ID is kept (the log bus assigns ids); zero lets SQLite pick one.
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT OR REPLACE INTO logs (id,job_id,level,message,time) VALUES (NULLIF(?,0),?,?,?,?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	for _, e := range entries {
-		if _, err := stmt.ExecContext(ctx, e.JobID, e.Level, e.Message, ms(e.Time)); err != nil {
+		if _, err := stmt.ExecContext(ctx, e.ID, e.JobID, e.Level, e.Message, ms(e.Time)); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// MaxLogID returns the highest persisted log id (0 when empty).
+func (s *Store) MaxLogID(ctx context.Context) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0) FROM logs`).Scan(&id)
+	return id, err
 }
 
 func (s *Store) ListLogs(ctx context.Context, f LogFilter) ([]LogEntry, error) {

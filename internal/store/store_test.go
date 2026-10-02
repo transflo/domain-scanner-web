@@ -159,6 +159,27 @@ func TestLogsLevelFilterPagingAndPrune(t *testing.T) {
 	}
 }
 
+func TestInsertLogsKeepsExplicitIDsAndReportsMax(t *testing.T) {
+	s, ctx := openTemp(t), context.Background()
+	if max, err := s.MaxLogID(ctx); err != nil || max != 0 {
+		t.Fatalf("empty MaxLogID = %d,%v want 0", max, err)
+	}
+	err := s.InsertLogs(ctx, []LogEntry{
+		{ID: 41, Level: "info", Message: "a", Time: time.Now()},
+		{ID: 42, Level: "info", Message: "b", Time: time.Now()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if max, _ := s.MaxLogID(ctx); max != 42 {
+		t.Fatalf("MaxLogID = %d, want 42", max)
+	}
+	logs, _ := s.ListLogs(ctx, LogFilter{Limit: 10})
+	if logs[0].ID != 42 || logs[1].ID != 41 {
+		t.Fatalf("explicit ids not kept: %+v", logs)
+	}
+}
+
 func TestSettings(t *testing.T) {
 	s, ctx := openTemp(t), context.Background()
 	if _, ok, _ := s.GetSetting(ctx, "k"); ok {
