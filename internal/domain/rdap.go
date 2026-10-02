@@ -1,0 +1,152 @@
+package domain
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+)
+
+// RDAPResult is the outcome of an RDAP domain lookup.
+type RDAPResult int
+
+const (
+	// RDAPUnsupported: the TLD has no RDAP server in the IANA bootstrap file.
+	RDAPUnsupported RDAPResult = iota
+	// RDAPFound: the registry knows the domain (HTTP 200) — it is registered.
+	RDAPFound
+	// RDAPNotFound: the registry answered 404 — the domain is not registered.
+	RDAPNotFound
+	// RDAPError: no usable answer (rate limit, 5xx, network); callers must fall back or give up.
+	RDAPError
+)
+
+const (
+	defaultBootstrapURL = "https://data.iana.org/rdap/dns.json"
+	rdapUserAgent       = "domain-scanner-web/1.0 (+https://github.com/xuemian168/domain-scanner)"
+)
+
+// RDAPClient queries registry RDAP servers, locating them through the IANA bootstrap file.
+// RDAP is WHOIS's standardised HTTP replacement: it is machine readable and, unlike many
+// registries' port-43 WHOIS, generally open to automated clients.
+type RDAPClient struct {
+	HTTP         *http.Client
+	BootstrapURL string
+	BootstrapTTL time.Duration
+
+	mu      sync.Mutex
+	servers map[string]string
+	fetched time.Time
+}
+
+func NewRDAPClient() *RDAPClient {
+	return &RDAPClient{
+		HTTP:         &http.Client{Timeout: 10 * time.Second},
+		BootstrapURL: defaultBootstrapURL,
+		BootstrapTTL: 24 * time.Hour,
+	}
+}
+
+// Lookup asks the TLD's RDAP server about domain.
+func (c *RDAPClient) Lookup(ctx context.Context, domain string) (RDAPResult, error) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	i := strings.LastIndex(domain, ".")
+	if i < 0 || i == len(domain)-1 {
+		return RDAPError, fmt.Errorf("rdap: %q has no TLD", domain)
+	}
+	servers, err := c.bootstrap(ctx)
+	if err != nil {
+		return RDAPError, err
+	}
+	base, ok := servers[domain[i+1:]]
+	if !ok {
+		return RDAPUnsupported, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"domain/"+domain, nil)
+	if err != nil {
+		return RDAPError, err
+	}
+	req.Header.Set("Accept", "application/rdap+json")
+	req.Header.Set("User-Agent", rdapUserAgent)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return RDAPError, fmt.Errorf("rdap request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return RDAPFound, nil
+	case http.StatusNotFound:
+		return RDAPNotFound, nil
+	default:
+		return RDAPError, fmt.Errorf("rdap %s: HTTP %d", base, resp.StatusCode)
+	}
+}
+
+// bootstrap returns tld -> RDAP base URL (always ending in "/"), cached for BootstrapTTL.
+// A failed refresh falls back to the stale copy when there is one.
+func (c *RDAPClient) bootstrap(ctx context.Context) (map[string]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.servers != nil && time.Since(c.fetched) < c.BootstrapTTL {
+		return c.servers, nil
+	}
+	servers, err := c.fetchBootstrap(ctx)
+	if err != nil {
+		if c.servers != nil {
+			return c.servers, nil
+		}
+		return nil, err
+	}
+	c.servers, c.fetched = servers, time.Now()
+	return servers, nil
+}
+
+func (c *RDAPClient) fetchBootstrap(ctx context.Context) (map[string]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BootstrapURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", rdapUserAgent)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("rdap bootstrap: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("rdap bootstrap: HTTP %d", resp.StatusCode)
+	}
+	var doc struct {
+		Services [][][]string `json:"services"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&doc); err != nil {
+		return nil, fmt.Errorf("rdap bootstrap: %w", err)
+	}
+	servers := map[string]string{}
+	for _, svc := range doc.Services {
+		if len(svc) != 2 || len(svc[1]) == 0 {
+			continue
+		}
+		base := svc[1][0]
+		for _, u := range svc[1] { // prefer https
+			if strings.HasPrefix(u, "https://") {
+				base = u
+				break
+			}
+		}
+		if !strings.HasSuffix(base, "/") {
+			base += "/"
+		}
+		for _, tld := range svc[0] {
+			servers[strings.ToLower(tld)] = base
+		}
+	}
+	return servers, nil
+}

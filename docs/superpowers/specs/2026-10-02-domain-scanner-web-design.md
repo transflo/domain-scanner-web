@@ -61,9 +61,12 @@ docs/
 
 ### 检测语义(防误报)
 
-- 仅当 DNS(NS/A/MX)、WHOIS、SSL 均判定"未注册"才记为 `available`。
-- 任一检测超时/出错且无其他证据 → 记为 `unknown` 并写 warn 日志,**不推送、不计入可注册**。
-- 保留上游 reserved 规则与重试/指数退避。
+- 检测顺序:DNS(NS/A/MX)命中 ⇒ registered;否则 **RDAP**(IANA bootstrap 定位注册局,HTTP 200 = registered,404 = 未注册);RDAP 出错或该 TLD 不支持时才回退 **WHOIS**(含备用服务器与退避);判为未注册后再做 TLS 证书兜底,有证书 ⇒ registered。
+- 只有 RDAP 404 或 WHOIS 明确"无匹配"(且无 DNS/TLS 证据)才记为 `available`。
+- 任一检测超时/出错/被限流且无其他证据 → 记为 `unknown` 并写 warn 日志,**不推送、不计入可注册**。
+- 为什么需要 RDAP:真实环境验证发现部分注册局(如 `.li`/`.ch` 的 SWITCH)的 WHOIS 直接拒绝自动化客户端,只靠 WHOIS 会让整个后缀全部变成 unknown;RDAP 是 WHOIS 的标准化 HTTP 替代,对这些后缀可用。
+- 已知局限:个别注册局对"注册局保留名"也返回 404,此类域名会被报为可注册,实际注册时可能被拒。
+- 上游的"保留名启发式"(1-2 位字母、2-3 位数字一律视为保留)默认关闭,可在任务里勾选开启。
 
 ### 续跑
 

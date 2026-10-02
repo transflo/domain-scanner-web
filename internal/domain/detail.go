@@ -41,6 +41,8 @@ type Checker struct {
 	LookupMX func(string) ([]*net.MX, error)
 	Whois    func(domain string, servers ...string) (string, error)
 	HasTLS   func(domain string) bool
+	// RDAP is consulted before WHOIS when set; nil disables it.
+	RDAP func(ctx context.Context, domain string) (RDAPResult, error)
 
 	Retries   int           // attempts per WHOIS server
 	Backoff   time.Duration // base delay, doubled per retry
@@ -60,6 +62,7 @@ func NewChecker() *Checker {
 		return context.WithTimeout(context.Background(), 5*time.Second)
 	}
 	return &Checker{
+		RDAP: NewRDAPClient().Lookup,
 		LookupNS: func(d string) ([]*net.NS, error) {
 			ctx, cancel := withTimeout()
 			defer cancel()
@@ -129,9 +132,36 @@ func (c *Checker) Check(ctx context.Context, domain string) Verdict {
 		return v
 	}
 
+	// RDAP is authoritative when the registry answers; WHOIS is only the fallback.
+	rdapNote := ""
+	if c.RDAP != nil {
+		res, err := c.RDAP(ctx, domain)
+		switch res {
+		case RDAPFound:
+			v.Status, v.Reason = StatusRegistered, "RDAP: registry has this domain"
+			v.Signatures = append(v.Signatures, "RDAP")
+			return v
+		case RDAPNotFound:
+			if c.HasTLS != nil && c.HasTLS(domain) {
+				v.Status, v.Reason = StatusRegistered, "RDAP says free but a TLS certificate is served"
+				v.Signatures = append(v.Signatures, "SSL")
+			} else {
+				v.Status, v.Reason = StatusAvailable, "RDAP: registry has no such domain"
+			}
+			return v
+		case RDAPError:
+			if err != nil {
+				rdapNote = err.Error()
+			}
+		}
+	}
+
 	text, reason := c.queryWhois(ctx, domain)
 	if text == "" {
 		v.Status, v.Reason = StatusUnknown, reason
+		if rdapNote != "" {
+			v.Reason = rdapNote + "; " + reason
+		}
 		return v
 	}
 	lower := strings.ToLower(text)
