@@ -127,6 +127,96 @@ func TestRedactSecrets(t *testing.T) {
 	}
 }
 
+func TestEmitExtractsFirstClassFields(t *testing.T) {
+	b := New(nil, 10)
+	defer b.Close()
+	b.Emit("debug", "rdap", "request", 7, "GET ok", Fields{
+		"domain": "foo.com", "egress": "proxy-3", "duration_ms": 125, "status": 404,
+	})
+	got := b.Recent(5, "", 0)
+	if len(got) != 1 {
+		t.Fatalf("got %d entries", len(got))
+	}
+	e := got[0]
+	if e.Component != "rdap" || e.Event != "request" || e.JobID != 7 || e.Domain != "foo.com" ||
+		e.Egress != "proxy-3" || e.DurationMS != 125 {
+		t.Fatalf("first-class fields not extracted: %+v", e)
+	}
+	if _, dup := e.Fields["domain"]; dup {
+		t.Fatalf("domain must not be duplicated inside Fields: %v", e.Fields)
+	}
+	if e.Fields["status"] != 404 {
+		t.Fatalf("extra fields lost: %v", e.Fields)
+	}
+}
+
+func TestDurationFieldAcceptsTimeDuration(t *testing.T) {
+	b := New(nil, 10)
+	defer b.Close()
+	b.Emit("info", "check", "done", 0, "x", Fields{"duration_ms": 1500 * time.Millisecond})
+	if got := b.Recent(1, "", 0)[0].DurationMS; got != 1500 {
+		t.Fatalf("duration = %d, want 1500", got)
+	}
+}
+
+func TestLoggerSetsComponent(t *testing.T) {
+	b := New(nil, 10)
+	defer b.Close()
+	lg := b.Logger("egress")
+	lg.Warn("cooldown", 2, "proxy-1 cooling down", Fields{"seconds": 300})
+	e := b.Recent(1, "", 0)[0]
+	if e.Component != "egress" || e.Event != "cooldown" || e.Level != "warn" || e.JobID != 2 {
+		t.Fatalf("logger entry = %+v", e)
+	}
+}
+
+func TestMinLevelDropsLowerLevelsEverywhere(t *testing.T) {
+	var mu sync.Mutex
+	var persisted []store.LogEntry
+	b := New(func(es []store.LogEntry) { mu.Lock(); persisted = append(persisted, es...); mu.Unlock() }, 10)
+	ch, cancel := b.Subscribe()
+	defer cancel()
+	b.SetMinLevel("info")
+	b.Emit("debug", "check", "step", 0, "noise", nil)
+	b.Emit("info", "check", "done", 0, "kept", nil)
+	b.Close()
+	if got := b.Recent(10, "", 0); len(got) != 1 || got[0].Message != "kept" {
+		t.Fatalf("ring = %+v", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(persisted) != 1 {
+		t.Fatalf("sink got %d entries, want 1", len(persisted))
+	}
+	select {
+	case e := <-ch:
+		if e.Message != "kept" {
+			t.Fatalf("subscriber got %q", e.Message)
+		}
+	default:
+		t.Fatal("subscriber got nothing")
+	}
+	if b.MinLevel() != "info" {
+		t.Fatalf("MinLevel = %q", b.MinLevel())
+	}
+}
+
+func TestSecretsAreRedactedInMessageAndFields(t *testing.T) {
+	b := New(nil, 10)
+	defer b.Close()
+	b.SetSecrets("cfat_supersecrettoken", "")
+	b.Emit("info", "cloudflare", "auth", 0, "using token cfat_supersecrettoken now", Fields{
+		"header": "Bearer cfat_supersecrettoken", "n": 3,
+	})
+	e := b.Recent(1, "", 0)[0]
+	if strings.Contains(e.Message, "supersecret") || strings.Contains(e.Fields["header"].(string), "supersecret") {
+		t.Fatalf("secret leaked: %+v", e)
+	}
+	if e.Fields["n"] != 3 {
+		t.Fatalf("non-string field mangled: %v", e.Fields)
+	}
+}
+
 func TestConcurrentUseIsRaceFree(t *testing.T) {
 	b := New(func([]store.LogEntry) {}, 100)
 	var wg sync.WaitGroup

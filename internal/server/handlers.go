@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -246,11 +247,60 @@ func (a *api) uploadWordlist(w http.ResponseWriter, r *http.Request) {
 
 // ---- logs ----
 
-func (a *api) listLogs(w http.ResponseWriter, r *http.Request) {
+func logFilter(r *http.Request) store.LogFilter {
 	q := r.URL.Query()
-	items, err := a.Store.ListLogs(r.Context(), store.LogFilter{
-		Level: q.Get("level"), JobID: int64Query(r, "job_id"), Limit: intQuery(r, "limit"), BeforeID: int64Query(r, "before_id"),
-	})
+	return store.LogFilter{
+		Level: q.Get("level"), JobID: int64Query(r, "job_id"), Component: q.Get("component"),
+		Event: q.Get("event"), Domain: strings.ToLower(q.Get("domain")), Egress: q.Get("egress"),
+		Q: q.Get("q"), Limit: intQuery(r, "limit"), BeforeID: int64Query(r, "before_id"),
+	}
+}
+
+// matchLog applies a LogFilter to a live entry (the SSE stream is filtered server side).
+func matchLog(f store.LogFilter, e store.LogEntry) bool {
+	if f.Level != "" && store.LevelRank(e.Level) < store.LevelRank(f.Level) {
+		return false
+	}
+	if f.JobID != 0 && e.JobID != f.JobID {
+		return false
+	}
+	if (f.Component != "" && e.Component != f.Component) || (f.Event != "" && e.Event != f.Event) ||
+		(f.Domain != "" && e.Domain != f.Domain) || (f.Egress != "" && e.Egress != f.Egress) {
+		return false
+	}
+	if f.Q != "" {
+		q := strings.ToLower(f.Q)
+		if !strings.Contains(strings.ToLower(e.Message), q) && !strings.Contains(strings.ToLower(e.Domain), q) &&
+			!strings.Contains(strings.ToLower(e.Event), q) {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *api) exportLogs(w http.ResponseWriter, r *http.Request) {
+	f := logFilter(r)
+	f.Limit, f.BeforeID = 0, 0
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="domain-scanner-logs.jsonl"`)
+	enc := json.NewEncoder(w)
+	err := a.Store.EachLog(r.Context(), f, func(e store.LogEntry) error { return enc.Encode(e) })
+	if err != nil {
+		a.Bus.Log("error", 0, "导出日志失败:%v", err)
+	}
+}
+
+func (a *api) logComponents(w http.ResponseWriter, r *http.Request) {
+	items, err := a.Store.LogComponents(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (a *api) listLogs(w http.ResponseWriter, r *http.Request) {
+	items, err := a.Store.ListLogs(r.Context(), logFilter(r))
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -274,7 +324,7 @@ func (a *api) streamLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	minLevel, jobID := r.URL.Query().Get("level"), int64Query(r, "job_id")
+	filter := logFilter(r)
 	ch, cancel := a.Bus.Subscribe()
 	defer cancel()
 	beat := time.NewTicker(15 * time.Second)
@@ -289,10 +339,7 @@ func (a *api) streamLogs(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if minLevel != "" && store.LevelRank(e.Level) < store.LevelRank(minLevel) {
-				continue
-			}
-			if jobID != 0 && e.JobID != jobID {
+			if !matchLog(filter, e) {
 				continue
 			}
 			data, _ := jsonMarshal(e)

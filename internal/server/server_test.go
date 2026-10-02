@@ -461,6 +461,105 @@ func TestLogsHistoryAndStream(t *testing.T) {
 	}
 }
 
+func TestLogsFiltersExportAndComponents(t *testing.T) {
+	f := newFixture(t)
+	c := f.login(t)
+	now := time.Now()
+	f.st.InsertLogs(context.Background(), []store.LogEntry{
+		{ID: 10, Level: "debug", Component: "dns", Event: "lookup", Message: "ns foo.com", Domain: "foo.com", Egress: "direct", DurationMS: 12, Time: now},
+		{ID: 11, Level: "warn", Component: "rdap", Event: "throttle", Message: "429 from nic.ch", Egress: "proxy-2", Time: now,
+			Fields: map[string]any{"wait_s": 5}},
+		{ID: 12, Level: "error", Component: "notifier", Event: "send_failed", Message: "chat not found", Time: now},
+	})
+
+	resp := f.do(t, c, "GET", "/api/logs?component=rdap", nil)
+	var one struct {
+		Items []store.LogEntry `json:"items"`
+	}
+	decode(t, resp, &one)
+	if len(one.Items) != 1 || one.Items[0].Event != "throttle" || one.Items[0].Fields["wait_s"] != float64(5) {
+		t.Fatalf("component filter = %+v", one.Items)
+	}
+	resp = f.do(t, c, "GET", "/api/logs?q=chat+not+found&level=warn", nil)
+	decode(t, resp, &one)
+	if len(one.Items) != 1 || one.Items[0].Component != "notifier" {
+		t.Fatalf("text filter = %+v", one.Items)
+	}
+	resp = f.do(t, c, "GET", "/api/logs?domain=foo.com&egress=direct", nil)
+	decode(t, resp, &one)
+	if len(one.Items) != 1 || one.Items[0].DurationMS != 12 {
+		t.Fatalf("domain+egress filter = %+v", one.Items)
+	}
+
+	resp = f.do(t, c, "GET", "/api/logs/export?level=warn", nil)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/x-ndjson") ||
+		!strings.Contains(resp.Header.Get("Content-Disposition"), "attachment") {
+		t.Fatalf("export headers: %v", resp.Header)
+	}
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("export lines = %d, want 2 (warn+error): %q", len(lines), body)
+	}
+	var first store.LogEntry
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil || first.Component != "rdap" {
+		t.Fatalf("first export line not chronological JSON: %v %q", err, lines[0])
+	}
+
+	resp = f.do(t, c, "GET", "/api/logs/components", nil)
+	var comps struct {
+		Items []string `json:"items"`
+	}
+	decode(t, resp, &comps)
+	if strings.Join(comps.Items, ",") != "dns,notifier,rdap" {
+		t.Fatalf("components = %v", comps.Items)
+	}
+}
+
+func TestStreamFiltersByComponent(t *testing.T) {
+	f := newFixture(t)
+	c := f.login(t)
+	req, _ := http.NewRequest("GET", f.srv.URL+"/api/logs/stream?component=egress", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := c.Do(req.WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	lines := make(chan string, 20)
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+		close(lines)
+	}()
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		f.bus.Emit("info", "check", "done", 0, "other component", nil)
+		f.bus.Emit("info", "egress", "switch", 0, "wanted line", nil)
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case l, ok := <-lines:
+			if !ok {
+				t.Fatal("stream closed")
+			}
+			if strings.Contains(l, "other component") {
+				t.Fatal("stream delivered a line from another component")
+			}
+			if strings.HasPrefix(l, "data:") && strings.Contains(l, "wanted line") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("did not receive the filtered line")
+		}
+	}
+}
+
 func TestWordlistUploadAndList(t *testing.T) {
 	f := newFixture(t)
 	c := f.login(t)

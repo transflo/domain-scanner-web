@@ -28,6 +28,10 @@ type Bus struct {
 	pending []store.LogEntry
 	sink    func([]store.LogEntry)
 
+	minRank  int
+	minLevel string
+	secrets  []string
+
 	closeOnce sync.Once
 	done      chan struct{}
 	wg        sync.WaitGroup
@@ -53,15 +57,127 @@ func (b *Bus) SetStartID(n int64) {
 	b.mu.Unlock()
 }
 
-// Log records an entry. It never blocks on subscribers or the sink.
+// Fields carries structured attributes. The keys "domain", "egress" and "duration_ms" are
+// promoted to first-class columns; everything else stays in the entry's Fields.
+type Fields map[string]any
+
+// Log records a free-form line under the "system" component. Prefer Emit/Logger for new code.
 func (b *Bus) Log(level string, jobID int64, format string, args ...any) {
 	msg := format
 	if len(args) > 0 {
 		msg = fmt.Sprintf(format, args...)
 	}
+	b.Emit(level, "system", "log", jobID, msg, nil)
+}
+
+// SetMinLevel drops everything below level (ring, subscribers and sink alike).
+func (b *Bus) SetMinLevel(level string) {
+	b.mu.Lock()
+	b.minRank = store.LevelRank(level)
+	b.minLevel = level
+	b.mu.Unlock()
+}
+
+// MinLevel returns the current minimum level ("debug" by default).
+func (b *Bus) MinLevel() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.minLevel == "" {
+		return "debug"
+	}
+	return b.minLevel
+}
+
+// SetSecrets registers values that must never appear in logs; they are masked in messages and
+// string fields. Empty strings are ignored.
+func (b *Bus) SetSecrets(secrets ...string) {
+	var keep []string
+	for _, s := range secrets {
+		if len(s) >= 6 {
+			keep = append(keep, s)
+		}
+	}
+	b.mu.Lock()
+	b.secrets = keep
+	b.mu.Unlock()
+}
+
+// Logger is a Bus bound to one component name.
+type Logger struct {
+	b         *Bus
+	component string
+}
+
+func (b *Bus) Logger(component string) *Logger { return &Logger{b: b, component: component} }
+
+func (l *Logger) Emit(level, event string, jobID int64, msg string, f Fields) {
+	l.b.Emit(level, l.component, event, jobID, msg, f)
+}
+func (l *Logger) Debug(event string, jobID int64, msg string, f Fields) {
+	l.Emit("debug", event, jobID, msg, f)
+}
+func (l *Logger) Info(event string, jobID int64, msg string, f Fields) {
+	l.Emit("info", event, jobID, msg, f)
+}
+func (l *Logger) Warn(event string, jobID int64, msg string, f Fields) {
+	l.Emit("warn", event, jobID, msg, f)
+}
+func (l *Logger) Error(event string, jobID int64, msg string, f Fields) {
+	l.Emit("error", event, jobID, msg, f)
+}
+
+func toMillis(v any) (int64, bool) {
+	switch d := v.(type) {
+	case time.Duration:
+		return d.Milliseconds(), true
+	case int:
+		return int64(d), true
+	case int64:
+		return d, true
+	case float64:
+		return int64(d), true
+	}
+	return 0, false
+}
+
+// Emit records a structured entry. It never blocks on subscribers or the sink.
+func (b *Bus) Emit(level, component, event string, jobID int64, msg string, f Fields) {
+	b.mu.Lock()
+	if store.LevelRank(level) < b.minRank {
+		b.mu.Unlock()
+		return
+	}
+	secrets := b.secrets
+	b.mu.Unlock()
+
+	clean := func(s string) string { return RedactSecrets(s, secrets...) }
+	e := store.LogEntry{JobID: jobID, Level: level, Component: component, Event: event, Message: clean(msg), Time: time.Now()}
+	if len(f) > 0 {
+		extra := make(map[string]any, len(f))
+		for k, v := range f {
+			switch k {
+			case "domain":
+				e.Domain, _ = v.(string)
+			case "egress":
+				e.Egress, _ = v.(string)
+			case "duration_ms":
+				if n, ok := toMillis(v); ok {
+					e.DurationMS = n
+				}
+			default:
+				if s, ok := v.(string); ok {
+					v = clean(s)
+				}
+				extra[k] = v
+			}
+		}
+		if len(extra) > 0 {
+			e.Fields = extra
+		}
+	}
 	b.mu.Lock()
 	b.next++
-	e := store.LogEntry{ID: b.next, JobID: jobID, Level: level, Message: msg, Time: time.Now()}
+	e.ID = b.next
 	if len(b.ring) < b.size {
 		b.ring = append(b.ring, e)
 	} else {

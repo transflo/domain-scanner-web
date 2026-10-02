@@ -72,6 +72,8 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/results/export", a.exportResults)
 	mux.HandleFunc("GET /api/logs", a.listLogs)
 	mux.HandleFunc("GET /api/logs/stream", a.streamLogs)
+	mux.HandleFunc("GET /api/logs/export", a.exportLogs)
+	mux.HandleFunc("GET /api/logs/components", a.logComponents)
 	mux.HandleFunc("GET /api/wordlists", a.listWordlists)
 	mux.HandleFunc("POST /api/wordlists", a.uploadWordlist)
 	mux.HandleFunc("GET /api/settings", a.getSettings)
