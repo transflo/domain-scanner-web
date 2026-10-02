@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -284,16 +285,77 @@ func matchLog(f store.LogFilter, e store.LogEntry) bool {
 	return true
 }
 
+// exportLogs streams every stored log row matching the filter (all of them when none is given),
+// oldest first, as JSON lines or as plain text. It reads the database, not the browser's buffer.
 func (a *api) exportLogs(w http.ResponseWriter, r *http.Request) {
 	f := logFilter(r)
 	f.Limit, f.BeforeID = 0, 0
-	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="domain-scanner-logs.jsonl"`)
-	enc := json.NewEncoder(w)
-	err := a.Store.EachLog(r.Context(), f, func(e store.LogEntry) error { return enc.Encode(e) })
-	if err != nil {
+	a.Bus.Flush() // lines still waiting in memory belong in the export too
+	stamp := time.Now().UTC().Format("2006-01-02-15-04-05")
+	text := r.URL.Query().Get("format") == "text"
+	var write func(store.LogEntry) error
+	if text {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="domain-scanner-`+stamp+`.log"`)
+		write = func(e store.LogEntry) error { _, err := io.WriteString(w, formatLogLine(e)+"\n"); return err }
+	} else {
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="domain-scanner-`+stamp+`.jsonl"`)
+		enc := json.NewEncoder(w)
+		write = func(e store.LogEntry) error { return enc.Encode(e) }
+	}
+	if err := a.Store.EachLog(r.Context(), f, write); err != nil {
 		a.Bus.Logger("http").Error("export_failed", 0, fmt.Sprintf("导出日志失败:%v", err), nil)
 	}
+}
+
+// formatLogLine renders one entry as a single readable line.
+func formatLogLine(e store.LogEntry) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %-5s", e.Time.UTC().Format("2006-01-02T15:04:05.000Z"), strings.ToUpper(e.Level))
+	if e.JobID > 0 {
+		fmt.Fprintf(&b, " [job %d]", e.JobID)
+	}
+	if e.Component != "" || e.Event != "" {
+		fmt.Fprintf(&b, " %s/%s", e.Component, e.Event)
+	}
+	b.WriteString(" ")
+	b.WriteString(strings.ReplaceAll(e.Message, "\n", " ⏎ "))
+	var extra []string
+	if e.Domain != "" {
+		extra = append(extra, "domain="+e.Domain)
+	}
+	if e.Egress != "" {
+		extra = append(extra, "egress="+e.Egress)
+	}
+	if e.DurationMS > 0 {
+		extra = append(extra, fmt.Sprintf("duration_ms=%d", e.DurationMS))
+	}
+	if len(e.Fields) > 0 {
+		if j, err := json.Marshal(e.Fields); err == nil {
+			extra = append(extra, "fields="+string(j))
+		}
+	}
+	if len(extra) > 0 {
+		b.WriteString(" | " + strings.Join(extra, " "))
+	}
+	return b.String()
+}
+
+func (a *api) storage(w http.ResponseWriter, r *http.Request) {
+	if a.Keeper == nil {
+		writeErr(w, http.StatusServiceUnavailable, "存储管理未启用")
+		return
+	}
+	writeJSON(w, http.StatusOK, a.Keeper.Last())
+}
+
+func (a *api) storageCleanup(w http.ResponseWriter, r *http.Request) {
+	if a.Keeper == nil {
+		writeErr(w, http.StatusServiceUnavailable, "存储管理未启用")
+		return
+	}
+	writeJSON(w, http.StatusOK, a.Keeper.Run(r.Context()))
 }
 
 func (a *api) diagnostics(w http.ResponseWriter, r *http.Request) {

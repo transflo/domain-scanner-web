@@ -258,6 +258,9 @@ func (b *Bus) flusher() {
 	}
 }
 
+// Flush persists everything buffered in memory now (exports call it so the newest lines are in).
+func (b *Bus) Flush() { b.flush() }
+
 func (b *Bus) flush() {
 	b.mu.Lock()
 	batch := b.pending

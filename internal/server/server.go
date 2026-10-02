@@ -14,6 +14,7 @@ import (
 
 	"domain_scanner/internal/appsettings"
 	"domain_scanner/internal/auth"
+	"domain_scanner/internal/housekeeping"
 	"domain_scanner/internal/logbus"
 	"domain_scanner/internal/notifier"
 	"domain_scanner/internal/scheduler"
@@ -39,6 +40,12 @@ type TelegramTester interface {
 	SendTest(ctx context.Context) error
 }
 
+// Keeper is the storage housekeeper (retention, size cap, disk guard).
+type Keeper interface {
+	Last() housekeeping.Report
+	Run(ctx context.Context) housekeeping.Report
+}
+
 type Deps struct {
 	Store            *store.Store
 	Bus              *logbus.Bus
@@ -47,6 +54,7 @@ type Deps struct {
 	Telegram         TelegramTester
 	Proxy            ProxyService
 	Cloudflare       CloudflareTester
+	Keeper           Keeper
 	Auth             *auth.Auth
 	TelegramEnv      notifier.Config // fallback when nothing is saved in settings
 	CloudflareEnv    appsettings.Cloudflare
@@ -81,6 +89,8 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/logs/export", a.exportLogs)
 	mux.HandleFunc("GET /api/logs/components", a.logComponents)
 	mux.HandleFunc("GET /api/diagnostics", a.diagnostics)
+	mux.HandleFunc("GET /api/storage", a.storage)
+	mux.HandleFunc("POST /api/storage/cleanup", a.storageCleanup)
 	mux.HandleFunc("GET /api/outbounds", a.listOutbounds)
 	mux.HandleFunc("POST /api/outbounds", a.createOutbound)
 	mux.HandleFunc("POST /api/outbounds/import", a.importOutbounds)

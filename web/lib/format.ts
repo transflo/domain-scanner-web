@@ -44,3 +44,11 @@ export function estimateSpace(pattern: string, length: number): number | null {
   const total = Math.pow(size, length)
   return Number.isSafeInteger(total) ? total : null
 }
+
+export function fmtBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0 B"
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)))
+  const v = n / Math.pow(1024, i)
+  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`
+}

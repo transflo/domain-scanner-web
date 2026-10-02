@@ -107,3 +107,30 @@ func TestSingleConfigForTesting(t *testing.T) {
 		t.Fatalf("inbounds = %v", c.Inbounds)
 	}
 }
+
+// xray prints one "accepted ..." line per proxied connection by default; at scan rates that would
+// flood the logs and the disk, so the access log must be off in every configuration we build.
+func TestXrayAccessLogIsOff(t *testing.T) {
+	multi, _, err := BuildConfig([]Entry{entry(1, vlessCfg)}, 21000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	single, err := BuildSingle(json.RawMessage(vlessCfg), 21001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, raw := range map[string][]byte{"BuildConfig": multi, "BuildSingle": single} {
+		var c struct {
+			Log struct {
+				Access   string `json:"access"`
+				LogLevel string `json:"loglevel"`
+			} `json:"log"`
+		}
+		if err := json.Unmarshal(raw, &c); err != nil {
+			t.Fatal(err)
+		}
+		if c.Log.Access != "none" || c.Log.LogLevel != "warning" {
+			t.Fatalf("%s: log = %+v", name, c.Log)
+		}
+	}
+}

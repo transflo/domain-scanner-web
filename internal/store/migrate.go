@@ -87,6 +87,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_component ON logs(component);
 CREATE INDEX IF NOT EXISTS idx_logs_domain ON logs(domain);
 CREATE INDEX IF NOT EXISTS idx_logs_event ON logs(event);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+CREATE INDEX IF NOT EXISTS idx_logs_time ON logs(time);
 CREATE INDEX IF NOT EXISTS idx_results_cf ON results(cf_status);
 `
 

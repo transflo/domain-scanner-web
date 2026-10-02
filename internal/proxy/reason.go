@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -86,3 +88,25 @@ const (
 	explainPoll     = 40 * time.Millisecond
 	explainPolls    = 5
 )
+
+// CleanTemp deletes throw-away test configurations older than maxAge (left behind if the process
+// died mid-test) and returns how many it removed. The live configuration is never touched.
+func (m *Manager) CleanTemp(maxAge time.Duration) int {
+	entries, err := os.ReadDir(m.Dir)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "test-") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > maxAge {
+			if os.Remove(filepath.Join(m.Dir, name)) == nil {
+				removed++
+			}
+		}
+	}
+	return removed
+}

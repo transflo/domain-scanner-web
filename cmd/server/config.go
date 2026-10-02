@@ -1,6 +1,7 @@
 package main
 
 import (
+	"domain_scanner/internal/housekeeping"
 	"errors"
 	"fmt"
 	"net/url"
@@ -22,6 +23,7 @@ type Config struct {
 	LogStdoutLevel  string            // lowest level printed to stdout (LOG_STDOUT_LEVEL); the DB keeps more
 	CFAccountID     string            // CLOUDFLARE_ACCOUNT_ID (the settings page overrides it)
 	CFToken         string            // CLOUDFLARE_API_TOKEN
+	Storage         housekeeping.Policy
 }
 
 const minPasswordLen = 8
@@ -72,6 +74,11 @@ func LoadConfig(getenv func(string) string) (*Config, error) {
 		}
 		c.TrustProxy = b
 	}
+	st, err := loadStoragePolicy(getenv)
+	if err != nil {
+		return nil, err
+	}
+	c.Storage = st
 	servers, err := parseRDAPServers(getenv("RDAP_SERVERS"))
 	if err != nil {
 		return nil, err
@@ -102,4 +109,35 @@ func parseRDAPServers(raw string) (map[string]string, error) {
 		out[tld] = base
 	}
 	return out, nil
+}
+
+// loadStoragePolicy reads the retention settings. Defaults keep a long-running instance's disk
+// use bounded; 0 turns a limit off.
+func loadStoragePolicy(getenv func(string) string) (housekeeping.Policy, error) {
+	var firstErr error
+	num := func(key string, def int) int {
+		v := strings.TrimSpace(getenv(key))
+		if v == "" {
+			return def
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s 必须是不小于 0 的整数(0 = 不限制),当前为 %q", key, v)
+			}
+			return def
+		}
+		return n
+	}
+	p := housekeeping.Policy{
+		DebugDays:         num("LOG_RETENTION_DEBUG_DAYS", 3),
+		InfoDays:          num("LOG_RETENTION_INFO_DAYS", 14),
+		WarnDays:          num("LOG_RETENTION_WARN_DAYS", 90),
+		MaxDebugRows:      num("LOG_MAX_DEBUG_ROWS", 500_000),
+		MaxOtherRows:      num("LOG_MAX_OTHER_ROWS", 500_000),
+		MaxDBBytes:        int64(num("DB_MAX_MB", 1024)) << 20,
+		UnknownResultDays: num("UNKNOWN_RESULT_DAYS", 30),
+		MinFreeBytes:      int64(num("MIN_FREE_MB", 1024)) << 20,
+	}
+	return p, firstErr
 }

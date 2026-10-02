@@ -19,6 +19,7 @@ import (
 	"domain_scanner/internal/auth"
 	"domain_scanner/internal/cloudflare"
 	"domain_scanner/internal/egress"
+	"domain_scanner/internal/housekeeping"
 	"domain_scanner/internal/logbus"
 	"domain_scanner/internal/notifier"
 	"domain_scanner/internal/proxy"
@@ -31,12 +32,9 @@ import (
 )
 
 const (
-	sessionTTL       = 7 * 24 * time.Hour
-	maxWordlistBytes = 20 << 20
-	// Per-level retention: per-step debug lines are plentiful, so they are capped separately and
-	// can never push warnings and errors out of the history.
-	debugLogsToKeep = 200_000
-	otherLogsToKeep = 500_000
+	sessionTTL        = 7 * 24 * time.Hour
+	maxWordlistBytes  = 20 << 20
+	housekeepingEvery = 15 * time.Minute
 )
 
 func main() {
@@ -87,6 +85,9 @@ func run(cfg *Config) error {
 		bus.SetMinLevel(lv)
 	}
 	sys := bus.Logger("system")
+	keeper := &housekeeping.Keeper{St: st, Bus: bus, Log: bus.Logger("housekeeping"), Policy: cfg.Storage,
+		DBPath: filepath.Join(cfg.DataDir, "scanner.db"), Disk: housekeeping.StatfsDisk,
+		UserLogLevel: func() string { return appsettings.LogLevel(st) }}
 
 	envTG := notifier.Config{Token: cfg.TelegramToken, ChatID: cfg.TelegramChatID}
 	envCF := appsettings.Cloudflare{AccountID: cfg.CFAccountID, Token: cfg.CFToken}
@@ -133,26 +134,20 @@ func run(cfg *Config) error {
 			return v
 		},
 	}
+	if n := mgr.CleanTemp(time.Hour); n > 0 {
+		sys.Info("temp_cleaned", 0, fmt.Sprintf("清理了 %d 个遗留的代理测试配置", n), nil)
+	}
 	go psvc.Run(rootCtx)
 
 	handler := server.New(server.Deps{
-		Store: st, Bus: bus, Sched: sched, Words: words, Telegram: nf, Auth: authn, Proxy: psvc, Cloudflare: cf,
+		Keeper: keeper, Store: st, Bus: bus, Sched: sched, Words: words, Telegram: nf, Auth: authn, Proxy: psvc, Cloudflare: cf,
 		TelegramEnv: envTG, CloudflareEnv: envCF, MaxWordlistBytes: maxWordlistBytes, TrustProxy: cfg.TrustProxy,
 	})
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 
-	go func() { // keep the log table bounded
-		t := time.NewTicker(10 * time.Minute)
-		defer t.Stop()
-		for {
-			select {
-			case <-rootCtx.Done():
-				return
-			case <-t.C:
-				_ = st.PruneLogsByLevel(context.Background(), debugLogsToKeep, otherLogsToKeep)
-			}
-		}
-	}()
+	// Retention, size cap, disk guard: what keeps a long-running instance from filling its disk.
+	keeper.Dir = cfg.DataDir
+	go keeper.Loop(rootCtx, housekeepingEvery)
 
 	sys.Info("start", 0, fmt.Sprintf("服务启动,监听 %s(口令保护已启用;Telegram %s;xray %s)", cfg.ListenAddr,
 		tgState(server.TelegramConfigFunc(st, envTG)()), xrayState(mgr)),

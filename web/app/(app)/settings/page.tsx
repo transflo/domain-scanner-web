@@ -5,6 +5,7 @@ import { CloudIcon, SendIcon, ShieldCheckIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import { Field, SelectField } from "@/components/field"
+import { StoragePanel } from "@/components/storage-panel"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -339,6 +340,8 @@ export default function SettingsPage() {
             </CardFooter>
           </form>
         </Card>
+
+        <StoragePanel />
 
         <Card size="sm" className="lg:col-span-2">
           <CardHeader>

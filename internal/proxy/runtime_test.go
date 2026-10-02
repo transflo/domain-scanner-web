@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -398,5 +399,33 @@ func TestRecentErrorsAreBounded(t *testing.T) {
 	m.xerrMu.Unlock()
 	if n > 200 {
 		t.Fatalf("ring holds %d lines", n)
+	}
+}
+
+func TestCleanTempRemovesStaleThrowawayConfigsOnly(t *testing.T) {
+	m, _ := newManager(t)
+	if err := os.MkdirAll(m.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(m.Dir, "test-123.json")
+	fresh := filepath.Join(m.Dir, "test-456.json")
+	keep := filepath.Join(m.Dir, "config.json")
+	for _, p := range []string{stale, fresh, keep} {
+		if err := os.WriteFile(p, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	n := m.CleanTemp(time.Hour)
+	if n != 1 {
+		t.Fatalf("removed %d files, want 1", n)
+	}
+	for p, want := range map[string]bool{stale: false, fresh: true, keep: true} {
+		if _, err := os.Stat(p); (err == nil) != want {
+			t.Fatalf("%s exists=%v, want %v", filepath.Base(p), err == nil, want)
+		}
 	}
 }

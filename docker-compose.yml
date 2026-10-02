@@ -1,11 +1,20 @@
 name: domain-scanner
 
+# Docker keeps every container's stdout forever by default. Rotate it so a long-running stack
+# cannot fill the disk through `docker logs`.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   scanner:
     build:
       context: .
       dockerfile: Dockerfile.scanner
     restart: unless-stopped
+    logging: *logging
     environment:
       # Mandatory: the service refuses to start (and compose refuses to run) without it.
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请在 .env 中设置 ADMIN_PASSWORD(至少 8 位)}
@@ -22,6 +31,15 @@ services:
       RDAP_SERVERS: ${RDAP_SERVERS:-}
       # Lowest level printed by `docker compose logs`; the database keeps everything (see the UI).
       LOG_STDOUT_LEVEL: ${LOG_STDOUT_LEVEL:-info}
+      # Disk hygiene for long runs (0 = no limit; see README "长期运行与磁盘"). Defaults are in the code.
+      LOG_RETENTION_DEBUG_DAYS: ${LOG_RETENTION_DEBUG_DAYS:-3}
+      LOG_RETENTION_INFO_DAYS: ${LOG_RETENTION_INFO_DAYS:-14}
+      LOG_RETENTION_WARN_DAYS: ${LOG_RETENTION_WARN_DAYS:-90}
+      LOG_MAX_DEBUG_ROWS: ${LOG_MAX_DEBUG_ROWS:-500000}
+      LOG_MAX_OTHER_ROWS: ${LOG_MAX_OTHER_ROWS:-500000}
+      DB_MAX_MB: ${DB_MAX_MB:-1024}
+      UNKNOWN_RESULT_DAYS: ${UNKNOWN_RESULT_DAYS:-30}
+      MIN_FREE_MB: ${MIN_FREE_MB:-1024}
       # The only client of this port is the web container, which appends the real client IP.
       TRUST_PROXY: "true"
     volumes:
@@ -34,6 +52,7 @@ services:
       args:
         SCANNER_URL: http://scanner:8080
     restart: unless-stopped
+    logging: *logging
     depends_on:
       scanner:
         condition: service_healthy

@@ -89,3 +89,34 @@ func TestErrorNeverEchoesThePassword(t *testing.T) {
 		t.Fatalf("error must not echo the password: %v", err)
 	}
 }
+
+func TestStorageDefaultsKeepTheDiskBounded(t *testing.T) {
+	c, err := LoadConfig(env(map[string]string{"ADMIN_PASSWORD": "long-enough-pw"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := c.Storage
+	if p.DebugDays != 3 || p.InfoDays != 14 || p.WarnDays != 90 || p.MaxDebugRows != 500_000 || p.MaxOtherRows != 500_000 ||
+		p.MaxDBBytes != 1024<<20 || p.UnknownResultDays != 30 || p.MinFreeBytes != 1024<<20 {
+		t.Fatalf("storage defaults = %+v", p)
+	}
+}
+
+func TestStorageOverridesAndValidation(t *testing.T) {
+	c, err := LoadConfig(env(map[string]string{"ADMIN_PASSWORD": "long-enough-pw", "LOG_RETENTION_DEBUG_DAYS": "1",
+		"DB_MAX_MB": "256", "MIN_FREE_MB": "0", "UNKNOWN_RESULT_DAYS": "0"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Storage.DebugDays != 1 || c.Storage.MaxDBBytes != 256<<20 || c.Storage.MinFreeBytes != 0 || c.Storage.UnknownResultDays != 0 {
+		t.Fatalf("overrides = %+v", c.Storage)
+	}
+	for _, key := range []string{"LOG_RETENTION_DEBUG_DAYS", "LOG_RETENTION_INFO_DAYS", "LOG_RETENTION_WARN_DAYS", "DB_MAX_MB", "MIN_FREE_MB", "UNKNOWN_RESULT_DAYS", "LOG_MAX_DEBUG_ROWS", "LOG_MAX_OTHER_ROWS"} {
+		for _, bad := range []string{"abc", "-1"} {
+			_, err := LoadConfig(env(map[string]string{"ADMIN_PASSWORD": "long-enough-pw", key: bad}))
+			if err == nil || !strings.Contains(err.Error(), key) {
+				t.Errorf("%s=%q: err = %v", key, bad, err)
+			}
+		}
+	}
+}

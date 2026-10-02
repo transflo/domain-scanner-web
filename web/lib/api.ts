@@ -15,6 +15,7 @@ import type {
   Settings,
   SettingsUpdate,
   Stats,
+  StorageReport,
   WordlistInfo,
 } from "@/lib/types"
 
@@ -90,7 +91,11 @@ export const api = {
   logs: (p: LogFilter) => request<{ items: LogEntry[] }>(`/logs${query({ ...p })}`).then((r) => r.items),
   logComponents: () => request<{ items: string[] }>("/logs/components").then((r) => r.items),
   streamUrl: (p: LogFilter) => `/api/logs/stream${query({ ...p, limit: undefined, before_id: undefined })}`,
-  logExportUrl: (p: LogFilter) => `/api/logs/export${query({ ...p, limit: undefined, before_id: undefined })}`,
+  /** `format` is "jsonl" (default) or "text"; pass an empty filter to export the whole history. */
+  logExportUrl: (p: LogFilter, format: "jsonl" | "text" = "jsonl") =>
+    `/api/logs/export${query({ ...p, limit: undefined, before_id: undefined, format: format === "text" ? "text" : undefined })}`,
+  storage: () => request<StorageReport>("/storage"),
+  cleanupStorage: () => request<StorageReport>("/storage/cleanup", json("POST")),
   diagnostics: (hours: number) => request<Diagnostics>(`/diagnostics${query({ hours })}`),
 
   // outbound proxies

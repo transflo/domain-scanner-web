@@ -256,3 +256,33 @@ export interface Diagnostics {
   logs: { count: number; oldest: string; newest: string }
   egresses: EgressStatus[]
 }
+
+export interface StoragePolicy {
+  DebugDays: number
+  InfoDays: number
+  WarnDays: number
+  MaxDebugRows: number
+  MaxOtherRows: number
+  MaxDBBytes: number
+  UnknownResultDays: number
+  MinFreeBytes: number
+}
+
+export interface StorageReport {
+  at: string
+  state: "" | "ok" | "low" | "critical"
+  level_forced: boolean
+  disk_free_bytes: number
+  disk_total_bytes: number
+  db_bytes: number
+  db_used_bytes: number
+  wal_bytes: number
+  auto_vacuum: number
+  logs: Record<string, number> | null
+  results: Record<string, number> | null
+  jobs: number
+  deleted_logs: number
+  deleted_unknown: number
+  policy: StoragePolicy
+  error?: string
+}

@@ -8,6 +8,9 @@ const nextConfig: NextConfig = {
   output: "standalone",
   // Compression buffers small chunks, which would stall the live log stream (SSE).
   compress: false,
+  // The rewrite proxy gives up on a quiet upstream after 30 s by default; a full log export or
+  // storage cleanup can take longer than that.
+  experimental: { proxyTimeout: 10 * 60 * 1000 },
   async rewrites() {
     return [{ source: "/api/:path*", destination: `${scannerUrl}/api/:path*` }]
   },

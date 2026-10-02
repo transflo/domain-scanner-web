@@ -56,7 +56,7 @@ func BuildConfig(entries []Entry, basePort int) ([]byte, map[int64]int, error) {
 		rules = append(rules, map[string]any{"type": "field", "inboundTag": []string{tagIn(e.ID)}, "outboundTag": tagOut(e.ID)})
 	}
 	cfg := map[string]any{
-		"log":       map[string]any{"loglevel": "warning"},
+		"log":       map[string]any{"loglevel": "warning", "access": "none"},
 		"inbounds":  inbounds,
 		"outbounds": outbounds,
 		"routing":   map[string]any{"domainStrategy": "AsIs", "rules": rules},
@@ -75,7 +75,7 @@ func BuildSingle(cfg json.RawMessage, port int) ([]byte, error) {
 	}
 	out["tag"] = tagOut(id)
 	c := map[string]any{
-		"log":       map[string]any{"loglevel": "warning"},
+		"log":       map[string]any{"loglevel": "warning", "access": "none"},
 		"inbounds":  []any{socksInbound(tagIn(id), port)},
 		"outbounds": []any{out},
 		"routing": map[string]any{"domainStrategy": "AsIs", "rules": []any{

@@ -211,8 +211,17 @@ test.describe("logs", () => {
     await page.getByLabel("关键字").fill("")
     await expect(lines.first()).toBeVisible()
 
-    const link = page.getByRole("button", { name: /导出 JSONL/ })
-    await expect(link).toHaveAttribute("href", /\/api\/logs\/export/)
+    // the export menu offers the whole server-side history, not just what this page has loaded
+    await page.getByRole("button", { name: /导出/ }).click()
+    const all = page.getByRole("menuitem", { name: /全部日志 · 文本/ })
+    await expect(all).toHaveAttribute("href", /\/api\/logs\/export\?format=text$/)
+    await expect(page.getByRole("menuitem", { name: /全部日志 · JSONL/ })).toHaveAttribute("href", "/api/logs/export")
+    const box = await page.getByRole("menu").boundingBox()
+    const vp = page.viewportSize()!
+    expect(box!.x).toBeGreaterThanOrEqual(-1)
+    expect(box!.x + box!.width).toBeLessThanOrEqual(vp.width + 1)
+    await shot(page, info, "logs-export-menu")
+    await page.keyboard.press("Escape")
 
     await page.getByRole("tab", { name: "诊断统计" }).click()
     await expect(page.getByTestId("diag-summary")).toBeVisible()
@@ -230,6 +239,10 @@ test.describe("settings", () => {
     }
     await expect(page.getByTestId("cloudflare-state")).toBeVisible()
     await expect(page.getByRole("checkbox", { name: /注册前二次确认/ })).toBeVisible()
+    await expect(page.getByText("存储与保留", { exact: true })).toBeVisible()
+    await expect(page.getByTestId("storage-state")).toBeVisible()
+    await expect(page.getByTestId("storage-db")).toContainText(/\d/)
+    await expect(page.getByRole("button", { name: "立即清理" })).toBeVisible()
     await shot(page, info, "settings")
     await expectNoPageOverflow(page)
 

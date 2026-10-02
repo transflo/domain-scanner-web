@@ -4,6 +4,7 @@ import { Suspense, useEffect, useMemo, useRef, useState } from "react"
 import { useSearchParams } from "next/navigation"
 import {
   ArrowDownToLineIcon,
+  ChevronDownIcon,
   ChevronRightIcon,
   DownloadIcon,
   SearchIcon,
@@ -15,6 +16,15 @@ import { SelectField } from "@/components/field"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -290,10 +300,26 @@ function LiveLogs() {
             <Trash2Icon data-icon="inline-start" />
             清屏
           </Button>
-          <Button variant="outline" size="sm" nativeButton={false} render={<a href={api.logExportUrl(filter)} download />}>
-            <DownloadIcon data-icon="inline-start" />
-            导出 JSONL
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger render={<Button variant="outline" size="sm" />}>
+              <DownloadIcon data-icon="inline-start" />
+              导出
+              <ChevronDownIcon data-icon="inline-end" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-64">
+              <DropdownMenuGroup>
+                <DropdownMenuLabel>服务器上保存的全部历史(所有级别)</DropdownMenuLabel>
+                <DropdownMenuItem render={<a href={api.logExportUrl({}, "text")} download />}>全部日志 · 文本 (.log)</DropdownMenuItem>
+                <DropdownMenuItem render={<a href={api.logExportUrl({}, "jsonl")} download />}>全部日志 · JSONL(含结构化字段)</DropdownMenuItem>
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <DropdownMenuLabel>仅当前筛选条件</DropdownMenuLabel>
+                <DropdownMenuItem render={<a href={api.logExportUrl(filter, "text")} download />}>当前筛选 · 文本 (.log)</DropdownMenuItem>
+                <DropdownMenuItem render={<a href={api.logExportUrl(filter, "jsonl")} download />}>当前筛选 · JSONL</DropdownMenuItem>
+              </DropdownMenuGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
 
