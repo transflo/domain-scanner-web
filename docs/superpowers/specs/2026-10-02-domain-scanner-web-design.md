@@ -15,7 +15,7 @@
 
 ### 非目标(YAGNI)
 
-- 多用户/鉴权体系(单用户自托管;仅提供可选的 `ADMIN_PASSWORD` 简单口令保护)。
+- 多用户/角色体系(单用户自托管;用**强制**的 `ADMIN_PASSWORD` 口令保护全部功能,见 §6)。
 - 域名注册/购买功能。
 - 除 Telegram 外的其他通知渠道。
 
@@ -73,7 +73,12 @@ docs/
 
 | 方法 路径 | 说明 |
 |---|---|
-| GET `/health` | 健康检查 |
+| GET `/health` | 健康检查(**唯一免认证接口**,只返回 `{"ok":true}`) |
+| POST `/auth/login` | 提交口令,成功后下发会话 cookie;失败返回 401 |
+| POST `/auth/logout` | 清除会话 cookie |
+| GET `/auth/me` | 返回当前是否已登录(前端据此跳转登录页) |
+
+以下所有接口均要求有效会话 cookie,否则返回 401(含 SSE `/logs/stream`)。
 | GET/POST `/jobs` | 列表 / 创建(参数:suffix、length、pattern、regex、wordlist_id|dict、delay_ms、workers) |
 | GET `/jobs/{id}` | 详情与进度 |
 | POST `/jobs/{id}/pause` `/resume` `/cancel` | 控制 |
@@ -91,6 +96,7 @@ docs/
 
 - 初始化严格使用 `pnpm dlx shadcn@latest init --preset b0 --template next`,其后仅通过 `shadcn add` 添加组件,不手写与主题冲突的样式。
 - 页面:
+  - **登录页**:口令输入框(shadcn Card + Input + Button),错误提示;未登录访问任何页面由 Next `middleware` 重定向到此;侧边栏提供退出登录。
   - **仪表盘**:运行中任务、进度、速率、累计可注册数、后端连接状态。
   - **任务**:列表 + 新建任务表单(Sheet/Dialog)+ 暂停/继续/取消/删除。
   - **结果**:Table,搜索/筛选、复制、导出 CSV。
@@ -101,7 +107,13 @@ docs/
 
 ## 6. 配置与密钥
 
-- `.env`(已 gitignore)与 `.env.example`:`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`、`ADMIN_PASSWORD`(可选)、`DATA_DIR`。
+- `.env`(已 gitignore)与 `.env.example`:`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`、`ADMIN_PASSWORD`(**必填**)、`DATA_DIR`。
+- **口令保护强制开启,无法关闭:**
+  - `ADMIN_PASSWORD` 为空或未设置时,scanner 拒绝启动并输出明确错误;`docker-compose.yml` 使用 `${ADMIN_PASSWORD:?请在 .env 中设置 ADMIN_PASSWORD}`,缺失时 `compose up` 直接失败。
+  - 最短长度 8 位,不足同样拒绝启动。
+  - 登录成功后下发 `HttpOnly`、`SameSite=Strict` 的会话 cookie(HMAC 签名,含过期时间,默认 7 天);签名密钥首次启动随机生成并保存在 SQLite,轮换口令时自动使旧会话失效(密钥由口令派生加盐)。
+  - 口令比较使用常量时间比较;登录接口按来源 IP 限流(连续 5 次失败锁定 5 分钟),并写 warn 日志(不记录口令)。
+  - scanner 的 8080 端口默认**不**映射到宿主机,所有访问必须经 web 的 3000 端口;即便直连 8080,除 `/health` 外也都需要认证。
 - 设置页写入的 Telegram 配置存入 SQLite settings,优先级高于环境变量;读取接口只返回脱敏 token。
 - 日志中不得输出 token(notifier 统一脱敏)。
 - 提交前对仓库全文扫描 token 与 chat id,确认无泄漏。
@@ -110,17 +122,18 @@ docs/
 
 - `scanner`:多阶段构建(golang → distroless/alpine),词库在构建期下载,`/data` 挂 named volume。
 - `web`:Next.js `output: "standalone"` 多阶段构建,pnpm。
-- `docker-compose.yml`:两个服务、healthcheck、`restart: unless-stopped`、仅暴露 web 的 3000 端口(scanner 8080 可选暴露用于调试)。
+- `docker-compose.yml`:两个服务、healthcheck、`restart: unless-stopped`、仅暴露 web 的 3000 端口(scanner 8080 不映射到宿主机)。
 
 ## 8. 测试与验证(完成前逐条执行)
 
 1. Go 单元测试:生成器确定性、状态机、续跑、notifier 批处理与重试(mock Telegram HTTP 服务)、检测语义(unknown 不得当 available)。
-2. `docker compose up -d --build`,健康检查通过。
-3. 容器内真实小规模扫描(如 `.li` 3 位数字),确认结果入库、日志流正常。
-4. 浏览器自动化遍历所有页面,检查控制台与网络请求无错误;截图确认 shadcn 主题生效。
-5. 向会话 id <CHAT_ID> 真实发送测试消息,并确认扫描命中时收到推送。
-6. `docker compose restart scanner`,确认运行中任务自动续跑。
-7. 密钥泄漏扫描通过后才允许 push。
+2. 认证验证:未设置/过短的 `ADMIN_PASSWORD` 时服务拒绝启动;未登录访问任一 `/api/*`(含 SSE)返回 401、访问页面被重定向到登录页;错误口令登录失败且连续 5 次后被限流;正确口令登录后全部功能可用;退出后会话失效。
+3. `docker compose up -d --build`,健康检查通过。
+4. 容器内真实小规模扫描(如 `.li` 3 位数字),确认结果入库、日志流正常。
+5. 浏览器自动化遍历所有页面,检查控制台与网络请求无错误;截图确认 shadcn 主题生效。
+6. 向会话 id <CHAT_ID> 真实发送测试消息,并确认扫描命中时收到推送。
+7. `docker compose restart scanner`,确认运行中任务自动续跑。
+8. 密钥泄漏扫描通过后才允许 push。
 
 ## 9. 仓库与许可
 
