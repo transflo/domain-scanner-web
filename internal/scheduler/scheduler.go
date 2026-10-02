@@ -1,5 +1,5 @@
 // Package scheduler owns scan jobs: validation, the queued/running/paused/done state machine,
-// and resuming interrupted jobs after a restart.
+// egress selection with error-storm failover, and resuming interrupted jobs after a restart.
 package scheduler
 
 import (
@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"domain_scanner/internal/domain"
+	"domain_scanner/internal/egress"
 	"domain_scanner/internal/enumerate"
 	"domain_scanner/internal/logbus"
 	"domain_scanner/internal/store"
@@ -23,8 +24,17 @@ var (
 	ErrState = errors.New("invalid state transition")
 )
 
+// CheckOpts are the per-check choices the scheduler makes.
+type CheckOpts struct {
+	UseReserved bool
+	Egress      string // egress id the check must use
+	// MaxRDAPWait, when > 0, caps how long an RDAP lookup waits out registry rate limits so a
+	// failing egress is noticed quickly (a failover target exists). 0 keeps the long default.
+	MaxRDAPWait time.Duration
+}
+
 type Checker interface {
-	Check(ctx context.Context, domain string, useReserved bool) domain.Verdict
+	Check(ctx context.Context, domain string, o CheckOpts) domain.Verdict
 }
 
 type Notifier interface {
@@ -46,13 +56,24 @@ type Params struct {
 	Workers     int    `json:"workers"`
 	UseReserved bool   `json:"use_reserved"`
 	Force       bool   `json:"force"`
+
+	// EgressMode is direct (default), proxy (ProxyID) or pool (any healthy proxy). Failover
+	// (default true) lets the job move to another egress when its own keeps failing.
+	EgressMode string `json:"egress_mode"`
+	ProxyID    int64  `json:"proxy_id"`
+	Failover   *bool  `json:"failover"`
 }
 
 type Options struct {
-	MaxParallelJobs int           // jobs running at once (default 2)
+	// MaxParallelJobs caps how many jobs routed through proxies run at once. Jobs on the direct
+	// connection are never limited. 0 means no cap at all.
+	MaxParallelJobs int
 	MaxSpace        int64         // candidates allowed without Force (default 5,000,000)
 	HardMaxSpace    int64         // absolute ceiling, even with Force (default 10,000,000,000)
 	SaveEvery       time.Duration // progress persistence interval (default 2s)
+	// Registry is the shared view of egresses (direct + proxies). Created empty when nil.
+	Registry *egress.Registry
+	Health   healthConfig // zero value = defaults
 }
 
 type runner struct {
@@ -64,15 +85,19 @@ type runner struct {
 
 type Scheduler struct {
 	st   *store.Store
-	log  *logbus.Bus
+	bus  *logbus.Bus
+	sl   *logbus.Logger // component "scheduler"
+	cl   *logbus.Logger // component "check"
+	el   *logbus.Logger // component "egress"
 	nf   Notifier
 	ck   Checker
 	wl   Words
 	opts Options
+	reg  *egress.Registry
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
-	sem        chan struct{}
+	sem        chan struct{} // nil = unlimited
 
 	mu      sync.Mutex
 	runners map[int64]*runner
@@ -80,9 +105,6 @@ type Scheduler struct {
 }
 
 func New(st *store.Store, log *logbus.Bus, nf Notifier, ck Checker, wl Words, opts Options) *Scheduler {
-	if opts.MaxParallelJobs <= 0 {
-		opts.MaxParallelJobs = 2
-	}
 	if opts.MaxSpace <= 0 {
 		opts.MaxSpace = 5_000_000
 	}
@@ -92,13 +114,23 @@ func New(st *store.Store, log *logbus.Bus, nf Notifier, ck Checker, wl Words, op
 	if opts.SaveEvery <= 0 {
 		opts.SaveEvery = 2 * time.Second
 	}
+	if opts.Registry == nil {
+		opts.Registry = egress.NewRegistry()
+	}
+	if opts.Health.Window == 0 {
+		opts.Health = defaultHealthConfig()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Scheduler{
-		st: st, log: log, nf: nf, ck: ck, wl: wl, opts: opts,
+	s := &Scheduler{
+		st: st, bus: log, sl: log.Logger("scheduler"), cl: log.Logger("check"), el: log.Logger("egress"),
+		nf: nf, ck: ck, wl: wl, opts: opts, reg: opts.Registry,
 		rootCtx: ctx, rootCancel: cancel,
-		sem:     make(chan struct{}, opts.MaxParallelJobs),
 		runners: map[int64]*runner{},
 	}
+	if opts.MaxParallelJobs > 0 {
+		s.sem = make(chan struct{}, opts.MaxParallelJobs)
+	}
+	return s
 }
 
 // Start re-queues every job that was queued or running when the process last stopped.
@@ -108,8 +140,10 @@ func (s *Scheduler) Start(ctx context.Context) error {
 		return err
 	}
 	for i := range jobs {
-		s.log.Log("info", jobs[i].ID, "恢复任务 #%d「%s」,从第 %d/%d 个候选继续", jobs[i].ID, jobs[i].Name, jobs[i].Cursor, jobs[i].Total)
-		s.launch(jobs[i].ID)
+		j := jobs[i]
+		s.sl.Info("recover", j.ID, fmt.Sprintf("恢复任务 #%d「%s」,从第 %d/%d 个候选继续", j.ID, j.Name, j.Cursor, j.Total),
+			logbus.Fields{"cursor": j.Cursor, "total": j.Total, "status": j.Status})
+		s.launch(j.ID)
 	}
 	return nil
 }
@@ -132,9 +166,24 @@ func (s *Scheduler) Create(ctx context.Context, p Params) (*store.Job, error) {
 	if p.DelayMS > 60000 {
 		p.DelayMS = 60000
 	}
+	failover := true
+	if p.Failover != nil {
+		failover = *p.Failover
+	}
+	mode := p.EgressMode
+	if mode == "" {
+		mode = "direct"
+	}
+	if err := s.validateEgress(mode, p.ProxyID); err != nil {
+		return nil, err
+	}
 	j := &store.Job{
 		Name: strings.TrimSpace(p.Name), Suffix: suffix, Pattern: p.Pattern, Regex: p.Regex, Wordlist: p.Wordlist,
 		Length: p.Length, DelayMS: p.DelayMS, Workers: p.Workers, UseReserved: p.UseReserved, Status: "queued",
+		EgressMode: mode, ProxyID: p.ProxyID, Failover: failover,
+	}
+	if mode != "proxy" {
+		j.ProxyID = 0
 	}
 	plan, err := s.buildPlan(j, p.Force)
 	if err != nil {
@@ -152,9 +201,39 @@ func (s *Scheduler) Create(ctx context.Context, p Params) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.log.Log("info", id, "创建任务 #%d「%s」:%d 个候选,%d 并发,间隔 %dms", id, j.Name, j.Total, j.Workers, j.DelayMS)
+	s.sl.Info("created", id, fmt.Sprintf("创建任务 #%d「%s」:%d 个候选,%d 并发,间隔 %dms,出口 %s", id, j.Name, j.Total, j.Workers, j.DelayMS, mode),
+		logbus.Fields{"total": j.Total, "workers": j.Workers, "delay_ms_per_worker": j.DelayMS, "egress_mode": mode,
+			"proxy_id": j.ProxyID, "failover": failover, "suffix": j.Suffix, "pattern": j.Pattern, "length": j.Length,
+			"wordlist": j.Wordlist, "regex": j.Regex, "use_reserved": j.UseReserved})
 	s.launch(id)
 	return s.st.GetJob(ctx, id)
+}
+
+func (s *Scheduler) validateEgress(mode string, proxyID int64) error {
+	switch mode {
+	case "direct":
+		return nil
+	case "proxy":
+		if proxyID <= 0 {
+			return fmt.Errorf("%w: 请选择一个代理", ErrInvalid)
+		}
+		if _, ok := s.reg.Get(egress.ProxyID(proxyID)); !ok {
+			return fmt.Errorf("%w: 代理 #%d 不存在或未启用", ErrInvalid, proxyID)
+		}
+	case "pool":
+		enabled := 0
+		for _, st := range s.reg.Snapshot() {
+			if !st.Direct && st.Enabled {
+				enabled++
+			}
+		}
+		if enabled == 0 {
+			return fmt.Errorf("%w: 代理池为空,请先添加并启用出站代理", ErrInvalid)
+		}
+	default:
+		return fmt.Errorf("%w: 未知的出口模式 %q(应为 direct、proxy 或 pool)", ErrInvalid, mode)
+	}
+	return nil
 }
 
 func (s *Scheduler) buildPlan(j *store.Job, force bool) (*enumerate.Plan, error) {
@@ -191,6 +270,7 @@ func (s *Scheduler) Pause(id int64) error {
 	if j.Status != "queued" && j.Status != "running" {
 		return fmt.Errorf("%w: cannot pause a %s job", ErrState, j.Status)
 	}
+	s.sl.Info("pause_requested", id, fmt.Sprintf("请求暂停任务 #%d", id), nil)
 	if !s.stop(id, "pause") {
 		return s.st.SetJobStatus(s.rootCtx, id, "paused", "")
 	}
@@ -205,8 +285,9 @@ func (s *Scheduler) Cancel(id int64) error {
 	if j.Status != "queued" && j.Status != "running" && j.Status != "paused" {
 		return fmt.Errorf("%w: cannot cancel a %s job", ErrState, j.Status)
 	}
+	s.sl.Info("cancel_requested", id, fmt.Sprintf("请求取消任务 #%d", id), nil)
 	if !s.stop(id, "cancel") {
-		s.log.Log("info", id, "任务 #%d 已取消", id)
+		s.sl.Info("cancelled", id, fmt.Sprintf("任务 #%d 已取消", id), nil)
 		return s.st.SetJobStatus(s.rootCtx, id, "cancelled", "")
 	}
 	return nil
@@ -224,13 +305,15 @@ func (s *Scheduler) Resume(id int64) error {
 	if err := s.st.SetJobStatus(s.rootCtx, id, "queued", ""); err != nil {
 		return err
 	}
-	s.log.Log("info", id, "任务 #%d 继续", id)
+	s.sl.Info("resume", id, fmt.Sprintf("任务 #%d 继续,从第 %d/%d 个候选", id, j.Cursor, j.Total),
+		logbus.Fields{"cursor": j.Cursor, "total": j.Total})
 	s.launch(id)
 	return nil
 }
 
 // Delete stops the job (if running), waits for it to wind down, then removes it with its data.
 func (s *Scheduler) Delete(ctx context.Context, id int64) error {
+	s.sl.Info("delete", id, fmt.Sprintf("删除任务 #%d", id), nil)
 	s.stop(id, "delete")
 	return s.st.DeleteJob(ctx, id)
 }

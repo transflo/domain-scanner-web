@@ -43,11 +43,12 @@ func LoadConfig(getenv func(string) string) (*Config, error) {
 		return nil, errors.New("ADMIN_PASSWORD 未设置或少于 8 位:口令保护是强制的,请在 .env 中设置至少 8 位的 ADMIN_PASSWORD")
 	}
 
-	c.MaxParallelJobs = 2
+	// 0 = unlimited. The cap only applies to jobs routed through proxies; direct jobs never wait.
+	c.MaxParallelJobs = 0
 	if v := strings.TrimSpace(getenv("MAX_PARALLEL_JOBS")); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 100 {
-			return nil, fmt.Errorf("MAX_PARALLEL_JOBS 必须是 1-100 的整数,当前为 %q", v)
+		if err != nil || n < 0 || n > 100 {
+			return nil, fmt.Errorf("MAX_PARALLEL_JOBS 必须是 0-100 的整数(0 = 不限制),当前为 %q", v)
 		}
 		c.MaxParallelJobs = n
 	}

@@ -211,10 +211,18 @@ func (c *RDAPClient) Lookup(ctx context.Context, domain string) (RDAPResult, err
 		}
 	}
 
+	maxWait := c.MaxWait
+	if d, ok := ctx.Value(maxWaitKey).(time.Duration); ok {
+		maxWait = d
+	}
 	start := time.Now()
-	for {
+	for attempt := 1; ; attempt++ {
+		t0 := time.Now()
 		if err := c.waitTurn(ctx, base); err != nil {
 			return RDAPError, err
+		}
+		if waited := time.Since(t0); waited > 50*time.Millisecond {
+			step(ctx, "rdap.wait", fmt.Sprintf("server=%s paced/paused for %s", base, waited.Round(time.Millisecond)), t0, true)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"domain/"+domain, nil)
 		if err != nil {
@@ -222,12 +230,16 @@ func (c *RDAPClient) Lookup(ctx context.Context, domain string) (RDAPResult, err
 		}
 		req.Header.Set("Accept", "application/rdap+json")
 		req.Header.Set("User-Agent", rdapUserAgent)
+		t1 := time.Now()
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
+			step(ctx, "rdap.request", fmt.Sprintf("server=%s attempt=%d error=%v", base, attempt, err), t1, false)
 			return RDAPError, fmt.Errorf("rdap request failed: %w", err)
 		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		step(ctx, "rdap.request", fmt.Sprintf("server=%s attempt=%d status=%d", base, attempt, resp.StatusCode), t1,
+			resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound)
 
 		switch resp.StatusCode {
 		case http.StatusOK:
@@ -238,7 +250,10 @@ func (c *RDAPClient) Lookup(ctx context.Context, domain string) (RDAPResult, err
 			return RDAPNotFound, nil
 		case http.StatusTooManyRequests:
 			wait := c.throttle(base, resp.Header)
-			if c.MaxWait > 0 && time.Since(start)+wait > c.MaxWait {
+			giveUp := maxWait > 0 && time.Since(start)+wait > maxWait
+			step(ctx, "rdap.throttle", fmt.Sprintf("server=%s HTTP 429, server pause %s, giving up=%v", base,
+				wait.Round(time.Millisecond), giveUp), time.Now(), false)
+			if giveUp {
 				return RDAPRateLimited, fmt.Errorf("rdap %s: HTTP 429 (rate limited, gave up after %s)",
 					base, time.Since(start).Round(time.Second))
 			}

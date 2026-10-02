@@ -330,6 +330,47 @@ func TestCheckerRDAPRateLimitedIsUnknownWithoutWhois(t *testing.T) {
 	}
 }
 
+func TestRDAPClientTracesEveryRequest(t *testing.T) {
+	c, _ := rateLimitFixture(t, 1, "0")
+	c.RetryDelay = 5 * time.Millisecond
+	var steps []Step
+	ctx := WithTrace(context.Background(), func(s Step) { steps = append(steps, s) })
+	if r, _ := c.Lookup(ctx, "taken.li"); r != RDAPFound {
+		t.Fatalf("lookup = %v", r)
+	}
+	var req, thr int
+	for _, s := range steps {
+		switch s.Name {
+		case "rdap.request":
+			req++
+			if !strings.Contains(s.Detail, "status=") {
+				t.Errorf("request step lacks status: %+v", s)
+			}
+		case "rdap.throttle":
+			thr++
+		}
+	}
+	if req != 2 || thr != 1 {
+		t.Fatalf("steps = %+v, want 2 requests and 1 throttle", steps)
+	}
+}
+
+func TestRDAPMaxWaitCanBeOverriddenPerCall(t *testing.T) {
+	c, _ := rateLimitFixture(t, 1000, "")
+	c.MaxBackoff = 20 * time.Millisecond
+	// the client default would wait for minutes; the caller wants a quick answer to fail over
+	c.MaxWait = 10 * time.Minute
+	ctx := WithRDAPMaxWait(context.Background(), 40*time.Millisecond)
+	start := time.Now()
+	got, err := c.Lookup(ctx, "taken.li")
+	if got != RDAPRateLimited || err == nil {
+		t.Fatalf("got %v, %v; want RDAPRateLimited", got, err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("per-call MaxWait ignored: waited %v", time.Since(start))
+	}
+}
+
 func TestRDAPClientCachesBootstrap(t *testing.T) {
 	f := newRDAPFixture(t)
 	for i := 0; i < 5; i++ {

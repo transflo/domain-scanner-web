@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"domain_scanner/internal/auth"
-	"domain_scanner/internal/domain"
+	"domain_scanner/internal/egress"
 	"domain_scanner/internal/logbus"
 	"domain_scanner/internal/notifier"
 	"domain_scanner/internal/scheduler"
@@ -29,15 +29,6 @@ const (
 	maxWordlistBytes = 20 << 20
 	logsToKeep       = 50000
 )
-
-// checker adapts domain.Checker to the scheduler's per-job "use reserved rules" switch.
-type checker struct{ base *domain.Checker }
-
-func (c checker) Check(ctx context.Context, d string, useReserved bool) domain.Verdict {
-	cc := *c.base
-	cc.UseReserved = useReserved
-	return cc.Check(ctx, d)
-}
 
 func main() {
 	cfg, err := LoadConfig(os.Getenv)
@@ -87,8 +78,10 @@ func run(cfg *Config) error {
 	nf.Start(rootCtx)
 
 	words := wordlists.NewManager(cfg.WordlistDir, filepath.Join(cfg.DataDir, "wordlists"))
-	sched := scheduler.New(st, bus, nf, checker{domain.NewChecker(cfg.RDAPServers, func(format string, args ...any) { bus.Log("warn", 0, format, args...) })}, words,
-		scheduler.Options{MaxParallelJobs: cfg.MaxParallelJobs})
+	reg := egress.NewRegistry()
+	checkers := newCheckerPool(reg, cfg.RDAPServers, func(format string, args ...any) { bus.Log("warn", 0, format, args...) })
+	sched := scheduler.New(st, bus, nf, checkers, words,
+		scheduler.Options{MaxParallelJobs: cfg.MaxParallelJobs, Registry: reg})
 	if err := sched.Start(ctx); err != nil {
 		return fmt.Errorf("恢复任务: %w", err)
 	}

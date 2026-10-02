@@ -3,10 +3,12 @@ package domain
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"strings"
 	"time"
 
+	"domain_scanner/internal/egress"
 	"domain_scanner/internal/reserved"
 
 	"github.com/likexian/whois"
@@ -30,6 +32,10 @@ type Verdict struct {
 	Status     Status
 	Signatures []string
 	Reason     string
+	// ErrKind says why an unknown verdict is unknown (empty for known verdicts).
+	ErrKind    ErrKind
+	Steps      []Step
+	DurationMS int64
 }
 
 // Checker decides whether a domain is registered. It reuses the upstream WHOIS indicator
@@ -53,23 +59,30 @@ type Checker struct {
 	UseReserved bool
 }
 
-// NewChecker returns a Checker wired to the real network. extraRDAP adds or replaces
-// TLD -> RDAP base URL entries on top of the built-in verified list.
+// NewChecker returns a Checker wired to the real network through the given egress (nil means
+// direct). Every egress needs its own Checker: RDAP rate limits are per source address, so the
+// throttle state must not be shared between paths.
 //
-// notice (optional) receives human-readable operational messages, e.g. when an RDAP server
-// asks us to slow down.
-func NewChecker(extraRDAP map[string]string, notice func(format string, args ...any)) *Checker {
+// extraRDAP adds or replaces TLD -> RDAP base URL entries on top of the built-in verified list.
+// notice (optional) receives human-readable operational messages, e.g. when an RDAP server asks
+// us to slow down. DNS pre-checks stay on the host's resolver: they never reach a registry.
+func NewChecker(extraRDAP map[string]string, notice func(format string, args ...any), eg *egress.Egress) *Checker {
+	if eg == nil {
+		eg = egress.Direct()
+	}
 	rdap := NewRDAPClient()
+	rdap.HTTP = eg.HTTPClient(10 * time.Second)
 	for tld, base := range extraRDAP {
 		rdap.Overrides[tld] = base
 	}
 	if notice != nil {
 		rdap.OnThrottle = func(base string, wait time.Duration) {
-			notice("RDAP 服务器 %s 返回 429 限流:所有任务暂停访问该服务器 %s 后自动重试(未决域名会等待,不会被误判)", base, wait.Round(time.Second))
+			notice("RDAP 服务器 %s 返回 429 限流(出口 %s):该出口上的所有任务暂停访问它 %s 后自动重试", base, eg.Name, wait.Round(time.Second))
 		}
 	}
 	wc := whois.NewClient()
 	wc.SetTimeout(10 * time.Second)
+	wc.SetDialer(eg)
 	resolver := net.DefaultResolver
 	withTimeout := func() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(context.Background(), 5*time.Second)
@@ -100,13 +113,18 @@ func NewChecker(extraRDAP map[string]string, notice func(format string, args ...
 		HasTLS: func(d string) bool {
 			// Presence probe only: we just ask "does anything serve a certificate here?" and
 			// send no data, so verification is deliberately skipped (self-signed still counts).
-			conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", d+":443",
-				&tls.Config{InsecureSkipVerify: true})
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			conn, err := eg.DialContext(ctx, "tcp", net.JoinHostPort(d, "443"))
 			if err != nil {
 				return false
 			}
 			defer conn.Close()
-			return len(conn.ConnectionState().PeerCertificates) > 0
+			tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: d})
+			if err := tc.HandshakeContext(ctx); err != nil {
+				return false
+			}
+			return len(tc.ConnectionState().PeerCertificates) > 0
 		},
 		Retries: 2,
 		Backoff: time.Second,
@@ -118,44 +136,80 @@ func NewChecker(extraRDAP map[string]string, notice func(format string, args ...
 	}
 }
 
-// Check classifies a domain. It never returns StatusAvailable without an explicit WHOIS signal.
+// Check classifies a domain. It never returns StatusAvailable without an explicit RDAP or
+// WHOIS signal. Every action is recorded as a Step on the returned Verdict (and reported live to
+// a WithTrace callback).
 func (c *Checker) Check(ctx context.Context, domain string) Verdict {
-	v := Verdict{Domain: domain}
+	if traceFrom(ctx) == nil {
+		ctx = context.WithValue(ctx, traceKey, &tracer{})
+	}
+	start := time.Now()
+	v := c.check(ctx, domain)
+	v.Domain = domain
+	step(ctx, "verdict", fmt.Sprintf("%s: %s", v.Status, v.Reason), start, v.Status != StatusUnknown)
+	v.Steps = traceFrom(ctx).snapshot()
+	v.DurationMS = time.Since(start).Milliseconds()
+	return v
+}
+
+func (c *Checker) check(ctx context.Context, domain string) Verdict {
+	var v Verdict
 	if ctx.Err() != nil {
-		v.Status, v.Reason = StatusUnknown, "cancelled"
+		v.Status, v.Reason, v.ErrKind = StatusUnknown, "cancelled", ErrCancelled
 		return v
 	}
 
-	if c.UseReserved && reserved.IsReservedDomain(domain) {
-		v.Status, v.Reason = StatusReserved, "matched reserved-name rules"
-		return v
+	if c.UseReserved {
+		t0 := time.Now()
+		hit := reserved.IsReservedDomain(domain)
+		step(ctx, "reserved", fmt.Sprintf("upstream reserved-name rules matched=%v", hit), t0, true)
+		if hit {
+			v.Status, v.Reason = StatusReserved, "matched reserved-name rules"
+			return v
+		}
 	}
 
+	t0 := time.Now()
+	var found []string
 	if ns, err := c.LookupNS(domain); err == nil && len(ns) > 0 {
 		v.Signatures = append(v.Signatures, "DNS_NS")
+		found = append(found, fmt.Sprintf("NS(%d)", len(ns)))
 	}
 	if ips, err := c.LookupIP(domain); err == nil && len(ips) > 0 {
 		v.Signatures = append(v.Signatures, "DNS_A")
+		found = append(found, fmt.Sprintf("A(%d)", len(ips)))
 	}
 	if mx, err := c.LookupMX(domain); err == nil && len(mx) > 0 {
 		v.Signatures = append(v.Signatures, "DNS_MX")
+		found = append(found, fmt.Sprintf("MX(%d)", len(mx)))
 	}
 	if len(v.Signatures) > 0 {
+		step(ctx, "dns", "records: "+strings.Join(found, " "), t0, true)
 		v.Status, v.Reason = StatusRegistered, "DNS records exist"
 		return v
 	}
+	step(ctx, "dns", "no NS/A/MX records", t0, true)
 
 	// RDAP is authoritative when the registry answers; WHOIS is only the fallback.
 	rdapNote := ""
 	if c.RDAP != nil {
+		t1 := time.Now()
 		res, err := c.RDAP(ctx, domain)
+		detail := map[RDAPResult]string{
+			RDAPFound: "registry has the domain", RDAPNotFound: "registry has no such domain",
+			RDAPUnsupported: "no RDAP server for this TLD", RDAPError: "no usable answer", RDAPRateLimited: "rate limited",
+		}[res]
+		if err != nil {
+			detail += ": " + err.Error()
+		}
+		step(ctx, "rdap", detail, t1, res == RDAPFound || res == RDAPNotFound)
 		switch res {
 		case RDAPFound:
 			v.Status, v.Reason = StatusRegistered, "RDAP: registry has this domain"
 			v.Signatures = append(v.Signatures, "RDAP")
 			return v
 		case RDAPNotFound:
-			if c.HasTLS != nil && c.HasTLS(domain) {
+			if c.probeTLS(ctx, domain) {
 				v.Status, v.Reason = StatusRegistered, "RDAP says free but a TLS certificate is served"
 				v.Signatures = append(v.Signatures, "SSL")
 			} else {
@@ -163,7 +217,7 @@ func (c *Checker) Check(ctx context.Context, domain string) Verdict {
 			}
 			return v
 		case RDAPRateLimited:
-			v.Status, v.Reason = StatusUnknown, "RDAP rate limited (HTTP 429)"
+			v.Status, v.Reason, v.ErrKind = StatusUnknown, "RDAP rate limited (HTTP 429)", ErrRateLimited
 			if err != nil {
 				v.Reason = err.Error()
 			}
@@ -175,9 +229,9 @@ func (c *Checker) Check(ctx context.Context, domain string) Verdict {
 		}
 	}
 
-	text, reason := c.queryWhois(ctx, domain)
+	text, reason, kind := c.queryWhois(ctx, domain)
 	if text == "" {
-		v.Status, v.Reason = StatusUnknown, reason
+		v.Status, v.Reason, v.ErrKind = StatusUnknown, reason, kind
 		if rdapNote != "" {
 			v.Reason = rdapNote + "; " + reason
 		}
@@ -187,7 +241,7 @@ func (c *Checker) Check(ctx context.Context, domain string) Verdict {
 
 	switch {
 	case isServiceError(lower):
-		v.Status, v.Reason = StatusUnknown, "whois service error or rate limit"
+		v.Status, v.Reason, v.ErrKind = StatusUnknown, "whois service error or rate limit", ErrRateLimited
 	case containsAny(lower, registeredIndicators):
 		v.Status, v.Reason = StatusRegistered, "whois shows registration data"
 		v.Signatures = append(v.Signatures, "WHOIS")
@@ -195,7 +249,7 @@ func (c *Checker) Check(ctx context.Context, domain string) Verdict {
 		v.Status, v.Reason = StatusReserved, "whois shows reserved status"
 		v.Signatures = append(v.Signatures, "RESERVED")
 	case isAvailableFromWHOIS(lower):
-		if c.HasTLS != nil && c.HasTLS(domain) {
+		if c.probeTLS(ctx, domain) {
 			v.Status, v.Reason = StatusRegistered, "whois says free but a TLS certificate is served"
 			v.Signatures = append(v.Signatures, "SSL")
 		} else {
@@ -205,14 +259,38 @@ func (c *Checker) Check(ctx context.Context, domain string) Verdict {
 		v.Status, v.Reason = StatusRegistered, "whois shows registration data"
 		v.Signatures = append(v.Signatures, "WHOIS")
 	default:
-		v.Status, v.Reason = StatusUnknown, "whois response not recognised"
+		v.Status, v.Reason, v.ErrKind = StatusUnknown, "whois response not recognised", ErrUnrecognised
 	}
 	return v
 }
 
+// probeTLS reports whether a certificate is served on :443, recording a "tls" step.
+func (c *Checker) probeTLS(ctx context.Context, domain string) bool {
+	if c.HasTLS == nil {
+		return false
+	}
+	t0 := time.Now()
+	has := c.HasTLS(domain)
+	detail := "no certificate served on :443"
+	if has {
+		detail = "certificate served on :443"
+	}
+	step(ctx, "tls", detail, t0, true)
+	return has
+}
+
+func errKindOf(err error) ErrKind {
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "timeout") || strings.Contains(s, "deadline exceeded") {
+		return ErrTimeout
+	}
+	return ErrNetwork
+}
+
 // queryWhois tries the default (IANA referral) lookup, then each fallback server, each with
-// retries and exponential backoff. It returns the first non-empty response.
-func (c *Checker) queryWhois(ctx context.Context, domain string) (text, reason string) {
+// retries and exponential backoff. It returns the first non-empty response; otherwise a reason
+// and the kind of failure.
+func (c *Checker) queryWhois(ctx context.Context, domain string) (text, reason string, kind ErrKind) {
 	servers := append([]string{""}, c.Fallbacks...)
 	retries := c.Retries
 	if retries < 1 {
@@ -220,10 +298,15 @@ func (c *Checker) queryWhois(ctx context.Context, domain string) (text, reason s
 	}
 	var lastErr error
 	for _, server := range servers {
+		label := server
+		if label == "" {
+			label = "iana-referral"
+		}
 		for i := 0; i < retries; i++ {
 			if ctx.Err() != nil {
-				return "", "cancelled"
+				return "", "cancelled", ErrCancelled
 			}
+			t0 := time.Now()
 			var res string
 			var err error
 			if server == "" {
@@ -232,24 +315,28 @@ func (c *Checker) queryWhois(ctx context.Context, domain string) (text, reason s
 				res, err = c.Whois(domain, server)
 			}
 			if err == nil && strings.TrimSpace(res) != "" {
-				return res, ""
+				step(ctx, "whois", fmt.Sprintf("server=%s attempt=%d bytes=%d", label, i+1, len(res)), t0, true)
+				return res, "", ErrNone
 			}
 			if err != nil {
 				lastErr = err
+				step(ctx, "whois", fmt.Sprintf("server=%s attempt=%d error=%v", label, i+1, err), t0, false)
+			} else {
+				step(ctx, "whois", fmt.Sprintf("server=%s attempt=%d empty response", label, i+1), t0, false)
 			}
 			if i < retries-1 && c.Backoff > 0 {
 				select {
 				case <-ctx.Done():
-					return "", "cancelled"
+					return "", "cancelled", ErrCancelled
 				case <-time.After(c.Backoff * time.Duration(1<<i)):
 				}
 			}
 		}
 	}
 	if lastErr != nil {
-		return "", "whois failed: " + lastErr.Error()
+		return "", "whois failed: " + lastErr.Error(), errKindOf(lastErr)
 	}
-	return "", "whois returned empty response"
+	return "", "whois returned empty response", ErrNetwork
 }
 
 func containsAny(s string, needles []string) bool {

@@ -178,6 +178,95 @@ func TestCheckerBackoffIsApplied(t *testing.T) {
 	}
 }
 
+func stepNames(steps []Step) []string {
+	var out []string
+	for _, s := range steps {
+		out = append(out, s.Name)
+	}
+	return out
+}
+
+func TestVerdictCarriesStepsAndDuration(t *testing.T) {
+	f := &fakeNet{whois: whoisReturns(`No match for "X.LI"`)}
+	v := f.checker().Check(context.Background(), "x.li")
+	names := stepNames(v.Steps)
+	for _, want := range []string{"dns", "whois", "tls", "verdict"} {
+		if !contains(names, want) {
+			t.Fatalf("steps %v miss %q", names, want)
+		}
+	}
+	if names[len(names)-1] != "verdict" || !strings.Contains(v.Steps[len(v.Steps)-1].Detail, "available") {
+		t.Fatalf("last step must summarise the verdict: %+v", v.Steps)
+	}
+	if v.DurationMS < 0 {
+		t.Fatalf("duration = %d", v.DurationMS)
+	}
+}
+
+func TestTraceCallbackReceivesStepsLiveInOrder(t *testing.T) {
+	f := &fakeNet{whois: whoisReturns("Registrar: Someone")}
+	var live []string
+	ctx := WithTrace(context.Background(), func(s Step) { live = append(live, s.Name) })
+	v := f.checker().Check(ctx, "x.li")
+	if strings.Join(live, ",") != strings.Join(stepNames(v.Steps), ",") || len(live) == 0 {
+		t.Fatalf("live steps %v != verdict steps %v", live, stepNames(v.Steps))
+	}
+}
+
+func TestDNSStepDescribesWhatWasFound(t *testing.T) {
+	f := &fakeNet{ns: []*net.NS{{Host: "ns1.example."}}, whois: whoisReturns("unused")}
+	v := f.checker().Check(context.Background(), "taken.li")
+	var dns *Step
+	for i := range v.Steps {
+		if v.Steps[i].Name == "dns" {
+			dns = &v.Steps[i]
+		}
+	}
+	if dns == nil || !dns.OK || !strings.Contains(dns.Detail, "NS") {
+		t.Fatalf("dns step = %+v", dns)
+	}
+}
+
+func TestErrorKindsDistinguishFailureModes(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(*fakeNet, *Checker)
+		want  ErrKind
+	}{
+		{"whois rate limit text", func(f *fakeNet, c *Checker) { f.whois = whoisReturns("too many requests") }, ErrRateLimited},
+		{"rdap rate limited", func(f *fakeNet, c *Checker) {
+			c.RDAP = func(context.Context, string) (RDAPResult, error) { return RDAPRateLimited, errors.New("429") }
+		}, ErrRateLimited},
+		{"whois timeout", func(f *fakeNet, c *Checker) {
+			f.whois = func(string, ...string) (string, error) { return "", errors.New("dial tcp: i/o timeout") }
+		}, ErrTimeout},
+		{"whois connection refused", func(f *fakeNet, c *Checker) {
+			f.whois = func(string, ...string) (string, error) { return "", errors.New("connection refused") }
+		}, ErrNetwork},
+		{"unrecognised whois", func(f *fakeNet, c *Checker) { f.whois = whoisReturns("lorem ipsum") }, ErrUnrecognised},
+	}
+	for _, tc := range cases {
+		f := &fakeNet{whois: whoisReturns("unused")}
+		c := f.checker()
+		tc.setup(f, c)
+		c.Whois = func(d string, s ...string) (string, error) { return f.whois(d, s...) }
+		v := c.Check(context.Background(), "x.li")
+		if v.Status != StatusUnknown || v.ErrKind != tc.want {
+			t.Errorf("%s: status=%s kind=%q, want unknown/%q", tc.name, v.Status, v.ErrKind, tc.want)
+		}
+	}
+	// known verdicts carry no error kind
+	f := &fakeNet{whois: whoisReturns(`No match for "X.LI"`)}
+	if v := f.checker().Check(context.Background(), "x.li"); v.ErrKind != "" {
+		t.Errorf("available verdict has ErrKind %q", v.ErrKind)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if v := f.checker().Check(ctx, "x.li"); v.ErrKind != ErrCancelled {
+		t.Errorf("cancelled verdict kind = %q", v.ErrKind)
+	}
+}
+
 func contains(xs []string, s string) bool {
 	for _, x := range xs {
 		if x == s {

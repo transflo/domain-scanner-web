@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"domain_scanner/internal/domain"
+	"domain_scanner/internal/egress"
 	"domain_scanner/internal/logbus"
 	"domain_scanner/internal/store"
 )
@@ -33,13 +34,24 @@ type fakeChecker struct {
 	unknown    map[string]bool
 	panicOn    string
 	reserved   atomic.Bool // records the useReserved flag seen
+
+	egressCalls map[string]int  // egress id -> number of checks routed there
+	failEgress  map[string]bool // egress ids that answer every check with a rate limit
+	lastOpts    atomic.Value    // CheckOpts of the latest call
 }
 
 func newFake() *fakeChecker {
-	return &fakeChecker{calls: map[string]int{}, release: make(chan struct{}), unknown: map[string]bool{}}
+	return &fakeChecker{calls: map[string]int{}, release: make(chan struct{}), unknown: map[string]bool{},
+		egressCalls: map[string]int{}, failEgress: map[string]bool{}}
 }
 
-func (f *fakeChecker) Check(ctx context.Context, d string, useReserved bool) domain.Verdict {
+func (f *fakeChecker) egressCount(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.egressCalls[id]
+}
+
+func (f *fakeChecker) Check(ctx context.Context, d string, o CheckOpts) domain.Verdict {
 	n := f.total.Add(1)
 	c := f.cur.Add(1)
 	defer f.cur.Add(-1)
@@ -49,12 +61,18 @@ func (f *fakeChecker) Check(ctx context.Context, d string, useReserved bool) dom
 			break
 		}
 	}
-	f.reserved.Store(useReserved)
+	f.reserved.Store(o.UseReserved)
+	f.lastOpts.Store(o)
 	f.mu.Lock()
 	f.calls[d]++
+	f.egressCalls[o.Egress]++
+	failing := f.failEgress[o.Egress]
 	f.mu.Unlock()
 	if f.blockAfter > 0 && n > f.blockAfter {
 		<-f.release
+	}
+	if failing {
+		return domain.Verdict{Domain: d, Status: domain.StatusUnknown, Reason: "429", ErrKind: domain.ErrRateLimited}
 	}
 	label := strings.SplitN(d, ".", 2)[0]
 	if label == f.panicOn {
@@ -111,6 +129,7 @@ type env struct {
 	bus *logbus.Bus
 	nf  *fakeNotifier
 	ck  *fakeChecker
+	reg *egress.Registry
 	s   *Scheduler
 	dir string
 }
@@ -122,7 +141,7 @@ func newEnv(t *testing.T, opts Options) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{st: st, bus: logbus.New(nil, 500), nf: &fakeNotifier{}, ck: newFake(), dir: dir}
+	e := &env{st: st, bus: logbus.New(nil, 500), nf: &fakeNotifier{}, ck: newFake(), dir: dir, reg: egress.NewRegistry()}
 	e.s = e.newScheduler(opts)
 	t.Cleanup(func() {
 		close2(e.ck.release)
@@ -141,6 +160,11 @@ func close2(ch chan struct{}) {
 func (e *env) newScheduler(opts Options) *Scheduler {
 	if opts.SaveEvery == 0 {
 		opts.SaveEvery = 10 * time.Millisecond
+	}
+	opts.Registry = e.reg
+	if opts.Health.Window == 0 { // fast, small windows so storms are easy to provoke
+		opts.Health = healthConfig{Window: 10, MinSamples: 5, Threshold: 0.6, BackoffBase: 5 * time.Millisecond,
+			BackoffMax: 20 * time.Millisecond, HealthyReset: 50 * time.Millisecond, ReturnAfter: time.Hour}
 	}
 	return New(e.st, e.bus, e.nf, e.ck, fakeWords{"builtin:tiny": {"alpha", "beta", "gamma"}, "builtin:empty": {}}, opts)
 }
@@ -404,23 +428,182 @@ func TestCheckerPanicBecomesUnknown(t *testing.T) {
 	}
 }
 
-func TestMaxParallelJobsKeepsOthersQueued(t *testing.T) {
+func (e *env) addProxies(ids ...int64) {
+	var entries []egress.ProxyEntry
+	for _, id := range ids {
+		entries = append(entries, egress.ProxyEntry{ID: egress.ProxyID(id), Name: fmt.Sprintf("p%d", id), Addr: "127.0.0.1:1", Enabled: true})
+	}
+	e.reg.Replace(entries)
+	for _, id := range ids {
+		e.reg.SetHealth(egress.ProxyID(id), true)
+	}
+}
+
+func proxyParams(id int64) Params {
+	p := digits2(2)
+	p.EgressMode, p.ProxyID = "proxy", id
+	return p
+}
+
+func TestMaxParallelJobsKeepsProxyJobsQueued(t *testing.T) {
 	e := newEnv(t, Options{MaxParallelJobs: 1})
+	e.addProxies(1)
 	e.ck.blockAfter = 3
 	e.start(t)
-	a, _ := e.s.Create(context.Background(), digits2(2))
+	a, err := e.s.Create(context.Background(), proxyParams(1))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for e.ck.total.Load() < 3 {
 		time.Sleep(2 * time.Millisecond)
 	}
-	b, _ := e.s.Create(context.Background(), digits2(2))
+	b, _ := e.s.Create(context.Background(), proxyParams(1))
 	time.Sleep(80 * time.Millisecond)
 	jb, _ := e.st.GetJob(context.Background(), b.ID)
 	if jb.Status != "queued" {
-		t.Fatalf("second job status = %q, want queued while the first holds the only slot", jb.Status)
+		t.Fatalf("second proxy job status = %q, want queued while the first holds the only slot", jb.Status)
 	}
 	close2(e.ck.release)
 	e.waitStatus(t, a.ID, "done")
 	e.waitStatus(t, b.ID, "done")
+}
+
+func TestDirectJobsAreNotLimitedByMaxParallelJobs(t *testing.T) {
+	e := newEnv(t, Options{MaxParallelJobs: 1})
+	e.ck.blockAfter = 2 // everything beyond the first two checks blocks, keeping both jobs "running"
+	e.start(t)
+	a, _ := e.s.Create(context.Background(), digits2(1))
+	b, _ := e.s.Create(context.Background(), digits2(1))
+	c, _ := e.s.Create(context.Background(), digits2(1))
+	for _, j := range []*store.Job{a, b, c} {
+		e.waitStatus(t, j.ID, "running")
+	}
+}
+
+func TestStormSwitchesADirectJobToAHealthyProxyAndFinishes(t *testing.T) {
+	e := newEnv(t, Options{})
+	e.addProxies(1)
+	e.ck.failEgress[egress.DirectID] = true
+	e.start(t)
+	j, err := e.s.Create(context.Background(), digits2(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := e.waitStatus(t, j.ID, "done")
+	if got.Checked != 100 || got.Cursor != 100 {
+		t.Fatalf("job = %+v", got)
+	}
+	if e.ck.egressCount(egress.ProxyID(1)) < 60 {
+		t.Fatalf("proxy handled %d checks; the job should have moved over after the storm", e.ck.egressCount(egress.ProxyID(1)))
+	}
+	if e.ck.egressCount(egress.DirectID) > 30 {
+		t.Fatalf("direct handled %d checks; the job kept hammering the failing egress", e.ck.egressCount(egress.DirectID))
+	}
+	if _, cooling := e.reg.Penalized(egress.DirectID); !cooling {
+		t.Fatal("direct must be cooling down after the storm")
+	}
+}
+
+func TestStormWithoutFailoverStaysOnDirectButBacksOff(t *testing.T) {
+	e := newEnv(t, Options{})
+	e.addProxies(1)
+	e.ck.failEgress[egress.DirectID] = true
+	e.start(t)
+	p := digits2(2)
+	off := false
+	p.Failover = &off
+	j, _ := e.s.Create(context.Background(), p)
+	got := e.waitStatus(t, j.ID, "done")
+	if e.ck.egressCount(egress.ProxyID(1)) != 0 {
+		t.Fatal("failover is off: the proxy must never be used")
+	}
+	if got.Unknown != 100 {
+		t.Fatalf("unknown = %d, every check failed", got.Unknown)
+	}
+}
+
+func TestFixedProxyJobUsesOnlyThatProxy(t *testing.T) {
+	e := newEnv(t, Options{})
+	e.addProxies(1, 2)
+	e.start(t)
+	j, err := e.s.Create(context.Background(), proxyParams(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.waitStatus(t, j.ID, "done")
+	if e.ck.egressCount(egress.ProxyID(2)) != 100 || e.ck.egressCount(egress.DirectID) != 0 || e.ck.egressCount(egress.ProxyID(1)) != 0 {
+		t.Fatalf("egress usage: %v", e.ck.egressCalls)
+	}
+}
+
+func TestPoolJobUsesOnlyHealthyProxies(t *testing.T) {
+	e := newEnv(t, Options{})
+	e.addProxies(1, 2)
+	e.reg.SetHealth(egress.ProxyID(1), false)
+	e.start(t)
+	p := digits2(2)
+	p.EgressMode = "pool"
+	j, err := e.s.Create(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.waitStatus(t, j.ID, "done")
+	if e.ck.egressCount(egress.ProxyID(2)) != 100 || e.ck.egressCount(egress.ProxyID(1)) != 0 {
+		t.Fatalf("egress usage: %v", e.ck.egressCalls)
+	}
+}
+
+func TestCreateValidatesEgressSettings(t *testing.T) {
+	e := newEnv(t, Options{})
+	ctx := context.Background()
+	bad := map[string]func(*Params){
+		"unknown mode":           func(p *Params) { p.EgressMode = "teleport" },
+		"proxy without id":       func(p *Params) { p.EgressMode = "proxy" },
+		"proxy that is missing":  func(p *Params) { p.EgressMode, p.ProxyID = "proxy", 42 },
+		"pool without any proxy": func(p *Params) { p.EgressMode = "pool" },
+	}
+	for name, mutate := range bad {
+		p := digits2(2)
+		mutate(&p)
+		if _, err := e.s.Create(ctx, p); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: err = %v, want ErrInvalid", name, err)
+		}
+	}
+	e.addProxies(1)
+	j, err := e.s.Create(ctx, proxyParams(1))
+	if err != nil || j.EgressMode != "proxy" || j.ProxyID != 1 || !j.Failover {
+		t.Fatalf("valid proxy job = %+v err=%v (failover must default to on)", j, err)
+	}
+	d, err := e.s.Create(ctx, digits2(2))
+	if err != nil || d.EgressMode != "direct" || !d.Failover {
+		t.Fatalf("default job = %+v err=%v", d, err)
+	}
+}
+
+func TestEveryCheckIsLoggedStepByStep(t *testing.T) {
+	e := newEnv(t, Options{})
+	e.start(t)
+	j, _ := e.s.Create(context.Background(), digits2(2)) // 100 candidates, 50 of them available
+	e.waitStatus(t, j.ID, "done")
+	time.Sleep(50 * time.Millisecond)
+	logs := e.bus.Recent(500, "debug", j.ID)
+	var done, found, lifecycle int
+	for _, l := range logs {
+		switch {
+		case l.Component == "check" && l.Event == "done":
+			done++
+			if l.Domain == "" || l.Egress != egress.DirectID {
+				t.Fatalf("check.done lacks domain/egress: %+v", l)
+			}
+		case l.Component == "check" && l.Event == "found":
+			found++
+		case l.Component == "scheduler":
+			lifecycle++
+		}
+	}
+	if done != 100 || found != 50 || lifecycle < 2 {
+		t.Fatalf("check.done=%d found=%d scheduler lines=%d (want 100, 50, >=2)", done, found, lifecycle)
+	}
 }
 
 func TestFilteredCandidatesStillAdvanceCursor(t *testing.T) {

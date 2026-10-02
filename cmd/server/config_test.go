@@ -25,7 +25,7 @@ func TestDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.ListenAddr != ":8080" || c.DataDir != "/data" || c.WordlistDir != "/app/wordlists" ||
-		c.MaxParallelJobs != 2 || c.TrustProxy {
+		c.MaxParallelJobs != 0 || c.TrustProxy {
 		t.Fatalf("defaults = %+v", c)
 	}
 }
@@ -45,7 +45,7 @@ func TestOverrides(t *testing.T) {
 }
 
 func TestInvalidNumbersAreErrors(t *testing.T) {
-	for _, bad := range []string{"abc", "0", "-3", "1000"} {
+	for _, bad := range []string{"abc", "-3", "1000"} {
 		_, err := LoadConfig(env(map[string]string{"ADMIN_PASSWORD": "long-enough-pw", "MAX_PARALLEL_JOBS": bad}))
 		if err == nil || !strings.Contains(err.Error(), "MAX_PARALLEL_JOBS") {
 			t.Errorf("MAX_PARALLEL_JOBS=%q: err = %v", bad, err)
