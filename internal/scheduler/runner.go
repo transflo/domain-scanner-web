@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"domain_scanner/internal/domain"
+	"domain_scanner/internal/egress"
 	"domain_scanner/internal/enumerate"
 	"domain_scanner/internal/logbus"
 	"domain_scanner/internal/store"
@@ -67,6 +68,14 @@ func (s *Scheduler) run(ctx context.Context, r *runner) {
 		s.sl.Error("start_failed", id, fmt.Sprintf("任务 #%d 启动失败:%v", id, err), logbus.Fields{"error": err.Error()})
 		_ = s.st.SetJobStatus(context.Background(), id, "failed", err.Error())
 		return
+	}
+	if job.EgressMode == "proxy" {
+		if _, ok := s.reg.Get(egress.ProxyID(job.ProxyID)); !ok && (!job.Failover || len(s.reg.Candidates(false)) == 0) {
+			msg := fmt.Sprintf("指定的代理 #%d 已被删除或停用,且没有可切换的可用代理", job.ProxyID)
+			s.sl.Error("start_failed", id, fmt.Sprintf("任务 #%d 启动失败:%s", id, msg), logbus.Fields{"proxy_id": job.ProxyID})
+			_ = s.st.SetJobStatus(context.Background(), id, "failed", msg)
+			return
+		}
 	}
 	_ = s.st.SetJobStatus(context.Background(), id, "running", "")
 	s.sl.Info("start", id, fmt.Sprintf("任务 #%d「%s」开始:共 %d 个候选,从 %d 继续", id, job.Name, plan.Total(), job.Cursor),

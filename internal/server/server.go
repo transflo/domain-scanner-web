@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"domain_scanner/internal/appsettings"
 	"domain_scanner/internal/auth"
 	"domain_scanner/internal/logbus"
 	"domain_scanner/internal/notifier"
@@ -43,8 +44,10 @@ type Deps struct {
 	Sched            Sched
 	Words            WordlistMgr
 	Telegram         TelegramTester
+	Proxy            ProxyService
 	Auth             *auth.Auth
 	TelegramEnv      notifier.Config // fallback when nothing is saved in settings
+	CloudflareEnv    appsettings.Cloudflare
 	MaxWordlistBytes int64
 	TrustProxy       bool // read the client IP from the last X-Forwarded-For entry
 }
@@ -56,6 +59,7 @@ const maxJSONBody = 1 << 20
 // New builds the HTTP handler. Everything except the public paths needs a valid session.
 func New(d Deps) http.Handler {
 	a := &api{d}
+	a.refreshSecrets()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.health)
 	mux.HandleFunc("POST /api/auth/login", a.login)
@@ -74,6 +78,17 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/logs/stream", a.streamLogs)
 	mux.HandleFunc("GET /api/logs/export", a.exportLogs)
 	mux.HandleFunc("GET /api/logs/components", a.logComponents)
+	mux.HandleFunc("GET /api/outbounds", a.listOutbounds)
+	mux.HandleFunc("POST /api/outbounds", a.createOutbound)
+	mux.HandleFunc("POST /api/outbounds/import", a.importOutbounds)
+	mux.HandleFunc("POST /api/outbounds/test-all", a.testAllOutbounds)
+	mux.HandleFunc("POST /api/outbounds/test-config", a.testOutboundConfig)
+	mux.HandleFunc("POST /api/outbounds/reload", a.reloadOutbounds)
+	mux.HandleFunc("GET /api/outbounds/{id}", a.getOutbound)
+	mux.HandleFunc("PUT /api/outbounds/{id}", a.updateOutbound)
+	mux.HandleFunc("DELETE /api/outbounds/{id}", a.deleteOutbound)
+	mux.HandleFunc("POST /api/outbounds/{id}/test", a.testOutbound)
+	mux.HandleFunc("GET /api/egresses", a.listEgresses)
 	mux.HandleFunc("GET /api/wordlists", a.listWordlists)
 	mux.HandleFunc("POST /api/wordlists", a.uploadWordlist)
 	mux.HandleFunc("GET /api/settings", a.getSettings)

@@ -18,6 +18,8 @@ type Config struct {
 	MaxParallelJobs int
 	TrustProxy      bool
 	RDAPServers     map[string]string // extra TLD -> RDAP base URL (RDAP_SERVERS)
+	XrayBin         string            // path of the xray-core binary (XRAY_BIN)
+	LogStdoutLevel  string            // lowest level printed to stdout (LOG_STDOUT_LEVEL); the DB keeps more
 }
 
 const minPasswordLen = 8
@@ -35,6 +37,8 @@ func LoadConfig(getenv func(string) string) (*Config, error) {
 		ListenAddr:     or("LISTEN_ADDR", ":8080"),
 		DataDir:        or("DATA_DIR", "/data"),
 		WordlistDir:    or("WORDLIST_DIR", "/app/wordlists"),
+		XrayBin:        or("XRAY_BIN", "/usr/local/bin/xray"),
+		LogStdoutLevel: strings.ToLower(or("LOG_STDOUT_LEVEL", "info")),
 		AdminPassword:  getenv("ADMIN_PASSWORD"),
 		TelegramToken:  strings.TrimSpace(getenv("TELEGRAM_BOT_TOKEN")),
 		TelegramChatID: strings.TrimSpace(getenv("TELEGRAM_CHAT_ID")),
@@ -44,6 +48,11 @@ func LoadConfig(getenv func(string) string) (*Config, error) {
 	}
 
 	// 0 = unlimited. The cap only applies to jobs routed through proxies; direct jobs never wait.
+	switch c.LogStdoutLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return nil, fmt.Errorf("LOG_STDOUT_LEVEL 必须是 debug、info、warn 或 error,当前为 %q", c.LogStdoutLevel)
+	}
 	c.MaxParallelJobs = 0
 	if v := strings.TrimSpace(getenv("MAX_PARALLEL_JOBS")); v != "" {
 		n, err := strconv.Atoi(v)

@@ -580,6 +580,34 @@ func TestCreateValidatesEgressSettings(t *testing.T) {
 	}
 }
 
+func TestJobPinnedToARemovedProxyFailsClearlyWithoutFailover(t *testing.T) {
+	e := newEnv(t, Options{})
+	id, _ := e.st.CreateJob(context.Background(), &store.Job{Name: "orphan", Suffix: ".li", Pattern: "d", Length: 1, Workers: 1,
+		Status: "queued", Total: 10, EgressMode: "proxy", ProxyID: 7, Failover: false})
+	if err := e.s.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := e.waitStatus(t, id, "failed")
+	if !strings.Contains(got.Error, "#7") {
+		t.Fatalf("error = %q, want it to name the missing proxy", got.Error)
+	}
+	if e.ck.total.Load() != 0 {
+		t.Fatal("no check may run against a missing egress")
+	}
+}
+
+func TestJobPinnedToARemovedProxyMovesToAHealthyOneWithFailover(t *testing.T) {
+	e := newEnv(t, Options{})
+	e.addProxies(1)
+	id, _ := e.st.CreateJob(context.Background(), &store.Job{Name: "orphan", Suffix: ".li", Pattern: "d", Length: 1, Workers: 1,
+		Status: "queued", Total: 10, EgressMode: "proxy", ProxyID: 7, Failover: true})
+	e.s.Start(context.Background())
+	e.waitStatus(t, id, "done")
+	if e.ck.egressCount(egress.ProxyID(1)) != 10 || e.ck.egressCount(egress.ProxyID(7)) != 0 {
+		t.Fatalf("egress usage: %v", e.ck.egressCalls)
+	}
+}
+
 func TestEveryCheckIsLoggedStepByStep(t *testing.T) {
 	e := newEnv(t, Options{})
 	e.start(t)

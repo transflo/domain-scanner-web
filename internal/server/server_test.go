@@ -14,12 +14,14 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"domain_scanner/internal/auth"
 	"domain_scanner/internal/logbus"
 	"domain_scanner/internal/notifier"
+	"domain_scanner/internal/proxy"
 	"domain_scanner/internal/scheduler"
 	"domain_scanner/internal/store"
 	"domain_scanner/internal/wordlists"
@@ -63,6 +65,26 @@ type fakeTG struct{ err error }
 
 func (f fakeTG) SendTest(context.Context) error { return f.err }
 
+// proxyHolder lets a test swap the outbound-proxy service behind the server.
+type proxyHolder struct {
+	mu    sync.Mutex
+	inner ProxyService
+}
+
+func (h *proxyHolder) set(p ProxyService)               { h.mu.Lock(); h.inner = p; h.mu.Unlock() }
+func (h *proxyHolder) get() ProxyService                { h.mu.Lock(); defer h.mu.Unlock(); return h.inner }
+func (h *proxyHolder) Reload(ctx context.Context) error { return h.get().Reload(ctx) }
+func (h *proxyHolder) TestOne(ctx context.Context, id int64) (proxy.ProbeResult, error) {
+	return h.get().TestOne(ctx, id)
+}
+func (h *proxyHolder) TestAll(ctx context.Context) map[int64]proxy.ProbeResult {
+	return h.get().TestAll(ctx)
+}
+func (h *proxyHolder) TestConfig(ctx context.Context, cfg []byte) proxy.ProbeResult {
+	return h.get().TestConfig(ctx, cfg)
+}
+func (h *proxyHolder) Status() proxy.Status { return h.get().Status() }
+
 type fixture struct {
 	srv   *httptest.Server
 	st    *store.Store
@@ -71,6 +93,7 @@ type fixture struct {
 	tg    *fakeTG
 	auth  *auth.Auth
 	words *wordlists.Manager
+	proxy *proxyHolder
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -86,8 +109,9 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	f := &fixture{st: st, bus: bus, auth: a, sched: &fakeSched{st: st}, tg: &fakeTG{},
-		words: wordlists.NewManager(filepath.Join(dir, "builtin"), filepath.Join(dir, "user"))}
-	h := New(Deps{Store: st, Bus: bus, Sched: f.sched, Words: f.words, Telegram: f.tg, Auth: a,
+		words: wordlists.NewManager(filepath.Join(dir, "builtin"), filepath.Join(dir, "user")),
+		proxy: &proxyHolder{inner: &fakeProxy{}}}
+	h := New(Deps{Store: st, Bus: bus, Sched: f.sched, Words: f.words, Telegram: f.tg, Auth: a, Proxy: f.proxy,
 		TelegramEnv: notifier.Config{}, MaxWordlistBytes: 1 << 20})
 	f.srv = httptest.NewServer(h)
 	t.Cleanup(func() { f.srv.Close(); bus.Close(); st.Close() })
@@ -385,6 +409,54 @@ func TestSettingsMaskTokenAndKeepOnPlaceholder(t *testing.T) {
 		if resp.StatusCode != 400 {
 			t.Errorf("PUT %v = %d, want 400", bad, resp.StatusCode)
 		}
+	}
+}
+
+func TestSettingsLogLevelAndProxyTestURL(t *testing.T) {
+	f := newFixture(t)
+	c := f.login(t)
+
+	resp := f.do(t, c, "GET", "/api/settings", nil)
+	var s struct {
+		LogLevel     string `json:"log_level"`
+		ProxyTestURL string `json:"proxy_test_url"`
+	}
+	decode(t, resp, &s)
+	if s.LogLevel != "debug" || s.ProxyTestURL != proxy.DefaultTestURL {
+		t.Fatalf("defaults = %+v", s)
+	}
+
+	resp = f.do(t, c, "PUT", "/api/settings", map[string]string{"log_level": "warn", "proxy_test_url": "https://example.com/204"})
+	decode(t, resp, &s)
+	if resp.StatusCode != 200 || s.LogLevel != "warn" || s.ProxyTestURL != "https://example.com/204" {
+		t.Fatalf("after PUT = %d %+v", resp.StatusCode, s)
+	}
+	if f.bus.MinLevel() != "warn" {
+		t.Fatalf("the bus must apply the new level at once, got %q", f.bus.MinLevel())
+	}
+	if v, _, _ := f.st.GetSetting(context.Background(), KeyLogLevel); v != "warn" {
+		t.Fatalf("level not persisted: %q", v)
+	}
+
+	for _, bad := range []map[string]string{{"log_level": "verbose"}, {"proxy_test_url": "ftp://x"}, {"proxy_test_url": "not a url"}} {
+		resp = f.do(t, c, "PUT", "/api/settings", bad)
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Errorf("PUT %v = %d, want 400", bad, resp.StatusCode)
+		}
+	}
+}
+
+func TestSavedSecretsAreRedactedFromLogs(t *testing.T) {
+	f := newFixture(t)
+	c := f.login(t)
+	const token = "123456789:AAHdummyDUMMYdummyDUMMYdummyDUMMY12345"
+	resp := f.do(t, c, "PUT", "/api/settings", map[string]string{"telegram_token": token, "telegram_chat_id": "42"})
+	resp.Body.Close()
+	f.bus.Log("info", 0, "leaky line with %s inside", token)
+	last := f.bus.Recent(1, "", 0)[0]
+	if strings.Contains(last.Message, "AAHdummy") {
+		t.Fatalf("a saved token reached the logs: %q", last.Message)
 	}
 }
 

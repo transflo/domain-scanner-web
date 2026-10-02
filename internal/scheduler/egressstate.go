@@ -66,6 +66,11 @@ func newEgressState(reg *egress.Registry, cfg healthConfig, mode string, proxyID
 	case "proxy":
 		s.preferred = egress.ProxyID(proxyID)
 		s.current = s.preferred
+		if _, ok := reg.Get(s.preferred); !ok && failover { // the pinned proxy is gone: start elsewhere
+			if c := reg.Candidates(false); len(c) > 0 {
+				s.current = c[0]
+			}
+		}
 	case "pool":
 		if c := reg.Candidates(false); len(c) > 0 {
 			s.current = c[0]
