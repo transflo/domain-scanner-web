@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -16,6 +17,7 @@ type Config struct {
 	TelegramChatID  string
 	MaxParallelJobs int
 	TrustProxy      bool
+	RDAPServers     map[string]string // extra TLD -> RDAP base URL (RDAP_SERVERS)
 }
 
 const minPasswordLen = 8
@@ -56,5 +58,34 @@ func LoadConfig(getenv func(string) string) (*Config, error) {
 		}
 		c.TrustProxy = b
 	}
+	servers, err := parseRDAPServers(getenv("RDAP_SERVERS"))
+	if err != nil {
+		return nil, err
+	}
+	c.RDAPServers = servers
 	return c, nil
+}
+
+// parseRDAPServers parses "tld=https://rdap.example/,tld2=https://..." into a map with
+// lower-cased TLD keys (leading dot allowed) and base URLs normalised to end in "/".
+func parseRDAPServers(raw string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		tld, base, ok := strings.Cut(item, "=")
+		tld = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(tld), "."))
+		base = strings.TrimSpace(base)
+		u, err := url.Parse(base)
+		if !ok || tld == "" || base == "" || err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return nil, fmt.Errorf("RDAP_SERVERS 格式错误:%q(应为 tld=https://rdap.example.com/)", item)
+		}
+		if !strings.HasSuffix(base, "/") {
+			base += "/"
+		}
+		out[tld] = base
+	}
+	return out, nil
 }

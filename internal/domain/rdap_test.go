@@ -108,18 +108,18 @@ func newRDAPFixture(t *testing.T) *rdapFixture {
 			http.Error(w, "bad accept", 406)
 			return
 		}
-		switch name {
-		case "taken.li":
+		switch {
+		case strings.HasPrefix(name, "taken."): // any TLD routed here counts as registered
 			w.Header().Set("Content-Type", "application/rdap+json")
-			fmt.Fprint(w, `{"objectClassName":"domain","ldhName":"taken.li"}`)
-		case "free.li":
+			fmt.Fprintf(w, `{"objectClassName":"domain","ldhName":%q}`, name)
+		case name == "free.li":
 			w.WriteHeader(404)
 			fmt.Fprint(w, `{"errorCode":404}`)
-		case "limited.li":
+		case name == "limited.li":
 			w.WriteHeader(429)
-		case "broken.li":
+		case name == "broken.li":
 			w.WriteHeader(503)
-		case "weird.li":
+		case name == "weird.li":
 			w.WriteHeader(400)
 		default:
 			w.WriteHeader(404)
@@ -127,6 +127,7 @@ func newRDAPFixture(t *testing.T) *rdapFixture {
 	})
 	mux.HandleFunc("/rdap-com/domain/", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) })
 	f.client = NewRDAPClient()
+	f.client.Overrides = map[string]string{} // tests must not touch the real servers
 	f.client.BootstrapURL = f.srv.URL + "/bootstrap.json"
 	return f
 }
@@ -156,6 +157,35 @@ func TestRDAPClientClassifiesResponses(t *testing.T) {
 	}
 }
 
+func TestRDAPDefaultsCoverTLDsMissingFromIANABootstrap(t *testing.T) {
+	c := NewRDAPClient()
+	for _, tld := range []string{"li", "ch", "de", "nl", "fr", "cz", "io", "ai", "pl"} {
+		if base := c.Overrides[tld]; !strings.HasPrefix(base, "https://") || !strings.HasSuffix(base, "/") {
+			t.Errorf("default RDAP server for .%s = %q, want an https URL ending in /", tld, base)
+		}
+	}
+}
+
+func TestRDAPOverridesWinAndSkipBootstrap(t *testing.T) {
+	f := newRDAPFixture(t)
+	// .de is not in the fake bootstrap; the override must be used without fetching it at all.
+	f.client.Overrides = map[string]string{"de": f.srv.URL + "/rdap-ch/"}
+	got, err := f.client.Lookup(context.Background(), "taken.de")
+	if got != RDAPFound || err != nil {
+		t.Fatalf("override lookup = %v, %v; want Found", got, err)
+	}
+	if n := f.bootstrapHits.Load(); n != 0 {
+		t.Fatalf("bootstrap fetched %d times although an override covered the TLD", n)
+	}
+	// an override also beats a bootstrap entry for the same TLD
+	// The bootstrap routes .com to /rdap-com/ (always 404); the override routes it to /rdap-ch/
+	// (taken.* is 200), so Found proves the override beat the bootstrap entry.
+	f.client.Overrides["com"] = f.srv.URL + "/rdap-ch/"
+	if got, _ := f.client.Lookup(context.Background(), "taken.com"); got != RDAPFound {
+		t.Fatalf("override should take precedence over bootstrap, got %v", got)
+	}
+}
+
 func TestRDAPClientCachesBootstrap(t *testing.T) {
 	f := newRDAPFixture(t)
 	for i := 0; i < 5; i++ {
@@ -168,6 +198,7 @@ func TestRDAPClientCachesBootstrap(t *testing.T) {
 
 func TestRDAPClientBootstrapFailureIsErrorNotUnsupported(t *testing.T) {
 	c := NewRDAPClient()
+	c.Overrides = nil
 	c.BootstrapURL = "http://127.0.0.1:1/never"
 	c.HTTP.Timeout = 500 * time.Millisecond
 	got, err := c.Lookup(context.Background(), "x.li")

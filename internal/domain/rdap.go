@@ -37,17 +37,43 @@ type RDAPClient struct {
 	HTTP         *http.Client
 	BootstrapURL string
 	BootstrapTTL time.Duration
+	// Overrides maps a TLD to an RDAP base URL (ending in "/") and wins over the IANA bootstrap.
+	// Many ccTLDs run RDAP but are not in the bootstrap file, so a verified list is built in.
+	Overrides map[string]string
 
 	mu      sync.Mutex
 	servers map[string]string
 	fetched time.Time
 }
 
+// defaultRDAPServers are ccTLD/gTLD RDAP endpoints that are absent from the IANA bootstrap
+// (or unreliable there) and were verified to answer 200 for a registered name and 404 for a
+// random unregistered one.
+var defaultRDAPServers = map[string]string{
+	"li": "https://rdap.nic.ch/",
+	"ch": "https://rdap.nic.ch/",
+	"de": "https://rdap.denic.de/",
+	"nl": "https://rdap.sidn.nl/",
+	"fr": "https://rdap.nic.fr/",
+	"cz": "https://rdap.nic.cz/",
+	"pl": "https://rdap.dns.pl/",
+	"io": "https://rdap.identitydigital.services/rdap/",
+	"ai": "https://rdap.identitydigital.services/rdap/",
+	"sh": "https://rdap.identitydigital.services/rdap/",
+	"ac": "https://rdap.identitydigital.services/rdap/",
+	"cc": "https://tld-rdap.verisign.com/cc/v1/",
+}
+
 func NewRDAPClient() *RDAPClient {
+	overrides := make(map[string]string, len(defaultRDAPServers))
+	for k, v := range defaultRDAPServers {
+		overrides[k] = v
+	}
 	return &RDAPClient{
 		HTTP:         &http.Client{Timeout: 10 * time.Second},
 		BootstrapURL: defaultBootstrapURL,
 		BootstrapTTL: 24 * time.Hour,
+		Overrides:    overrides,
 	}
 }
 
@@ -58,13 +84,16 @@ func (c *RDAPClient) Lookup(ctx context.Context, domain string) (RDAPResult, err
 	if i < 0 || i == len(domain)-1 {
 		return RDAPError, fmt.Errorf("rdap: %q has no TLD", domain)
 	}
-	servers, err := c.bootstrap(ctx)
-	if err != nil {
-		return RDAPError, err
-	}
-	base, ok := servers[domain[i+1:]]
+	tld := domain[i+1:]
+	base, ok := c.Overrides[tld]
 	if !ok {
-		return RDAPUnsupported, nil
+		servers, err := c.bootstrap(ctx)
+		if err != nil {
+			return RDAPError, err
+		}
+		if base, ok = servers[tld]; !ok {
+			return RDAPUnsupported, nil
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"domain/"+domain, nil)

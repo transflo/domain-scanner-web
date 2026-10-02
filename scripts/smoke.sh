@@ -20,15 +20,16 @@ C="Cookie: ds_session=$V"
 echo "authenticated /api/jobs        : $(code -H "$C" $B/api/jobs)   (want 200)"
 
 echo "--- create job"
-curl -s -H "$C" -X POST -H 'Content-Type: application/json' \
-  -d '{"suffix":".li","pattern":"d","length":2,"workers":4,"delay_ms":0,"name":"smoke .li 2d"}' $B/api/jobs
-echo
+R=$(curl -s -H "$C" -X POST -H 'Content-Type: application/json' \
+  -d '{"suffix":".li","pattern":"d","length":2,"workers":4,"delay_ms":0,"name":"smoke .li 2d"}' $B/api/jobs)
+echo "$R"
+ID=$(echo "$R" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
 sleep "$WAIT"
-echo "--- job 1"
-curl -s -H "$C" $B/api/jobs/1
+echo "--- job $ID"
+curl -s -H "$C" $B/api/jobs/$ID
 echo
-echo "--- results (available, first 5)"
-curl -s -H "$C" "$B/api/results?status=available&limit=5"
+echo "--- results (first 5)"
+curl -s -H "$C" "$B/api/results?job_id=$ID&limit=5"
 echo
 echo "--- logs (info+, last 8)"
 curl -s -H "$C" "$B/api/logs?level=info&limit=8"

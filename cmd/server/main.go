@@ -87,7 +87,7 @@ func run(cfg *Config) error {
 	nf.Start(rootCtx)
 
 	words := wordlists.NewManager(cfg.WordlistDir, filepath.Join(cfg.DataDir, "wordlists"))
-	sched := scheduler.New(st, bus, nf, checker{domain.NewChecker()}, words,
+	sched := scheduler.New(st, bus, nf, checker{domain.NewChecker(cfg.RDAPServers)}, words,
 		scheduler.Options{MaxParallelJobs: cfg.MaxParallelJobs})
 	if err := sched.Start(ctx); err != nil {
 		return fmt.Errorf("恢复任务: %w", err)

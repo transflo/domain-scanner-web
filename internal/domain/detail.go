@@ -53,8 +53,13 @@ type Checker struct {
 	UseReserved bool
 }
 
-// NewChecker returns a Checker wired to the real network.
-func NewChecker() *Checker {
+// NewChecker returns a Checker wired to the real network. extraRDAP adds or replaces
+// TLD -> RDAP base URL entries on top of the built-in verified list.
+func NewChecker(extraRDAP map[string]string) *Checker {
+	rdap := NewRDAPClient()
+	for tld, base := range extraRDAP {
+		rdap.Overrides[tld] = base
+	}
 	wc := whois.NewClient()
 	wc.SetTimeout(10 * time.Second)
 	resolver := net.DefaultResolver
@@ -62,7 +67,7 @@ func NewChecker() *Checker {
 		return context.WithTimeout(context.Background(), 5*time.Second)
 	}
 	return &Checker{
-		RDAP: NewRDAPClient().Lookup,
+		RDAP: rdap.Lookup,
 		LookupNS: func(d string) ([]*net.NS, error) {
 			ctx, cancel := withTimeout()
 			defer cancel()

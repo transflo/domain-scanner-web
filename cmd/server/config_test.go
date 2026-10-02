@@ -57,6 +57,32 @@ func TestInvalidNumbersAreErrors(t *testing.T) {
 	}
 }
 
+func TestRDAPServersParsing(t *testing.T) {
+	base := map[string]string{"ADMIN_PASSWORD": "long-enough-pw"}
+	with := func(v string) map[string]string {
+		m := map[string]string{"RDAP_SERVERS": v}
+		for k, x := range base {
+			m[k] = x
+		}
+		return m
+	}
+	c, err := LoadConfig(env(with("de=https://rdap.example.de , .LI=http://x.test/rdap")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RDAPServers["de"] != "https://rdap.example.de/" || c.RDAPServers["li"] != "http://x.test/rdap/" {
+		t.Fatalf("parsed = %v (want lower-cased tld keys and trailing slashes)", c.RDAPServers)
+	}
+	for _, bad := range []string{"de", "de=", "=https://x/", "de=ftp://x/", "de=not a url"} {
+		if _, err := LoadConfig(env(with(bad))); err == nil || !strings.Contains(err.Error(), "RDAP_SERVERS") {
+			t.Errorf("RDAP_SERVERS=%q: err = %v, want an error naming RDAP_SERVERS", bad, err)
+		}
+	}
+	if c, _ := LoadConfig(env(base)); len(c.RDAPServers) != 0 {
+		t.Fatalf("unset RDAP_SERVERS should give no overrides, got %v", c.RDAPServers)
+	}
+}
+
 func TestErrorNeverEchoesThePassword(t *testing.T) {
 	_, err := LoadConfig(env(map[string]string{"ADMIN_PASSWORD": "abc"}))
 	if err == nil || strings.Contains(err.Error(), "abc") {
