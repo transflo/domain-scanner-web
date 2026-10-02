@@ -55,10 +55,18 @@ type Checker struct {
 
 // NewChecker returns a Checker wired to the real network. extraRDAP adds or replaces
 // TLD -> RDAP base URL entries on top of the built-in verified list.
-func NewChecker(extraRDAP map[string]string) *Checker {
+//
+// notice (optional) receives human-readable operational messages, e.g. when an RDAP server
+// asks us to slow down.
+func NewChecker(extraRDAP map[string]string, notice func(format string, args ...any)) *Checker {
 	rdap := NewRDAPClient()
 	for tld, base := range extraRDAP {
 		rdap.Overrides[tld] = base
+	}
+	if notice != nil {
+		rdap.OnThrottle = func(base string, wait time.Duration) {
+			notice("RDAP 服务器 %s 返回 429 限流:所有任务暂停访问该服务器 %s 后自动重试(未决域名会等待,不会被误判)", base, wait.Round(time.Second))
+		}
 	}
 	wc := whois.NewClient()
 	wc.SetTimeout(10 * time.Second)

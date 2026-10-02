@@ -129,6 +129,8 @@ func newRDAPFixture(t *testing.T) *rdapFixture {
 	f.client = NewRDAPClient()
 	f.client.Overrides = map[string]string{} // tests must not touch the real servers
 	f.client.RetryDelay = time.Millisecond
+	f.client.MaxBackoff = 4 * time.Millisecond
+	f.client.MaxWait = 30 * time.Millisecond // an always-429 server must give up quickly in tests
 	f.client.BootstrapURL = f.srv.URL + "/bootstrap.json"
 	return f
 }
@@ -204,6 +206,7 @@ func rateLimitFixture(t *testing.T, limited int32, retryAfter string) (*RDAPClie
 	c := NewRDAPClient()
 	c.Overrides = map[string]string{"li": srv.URL + "/"}
 	c.RetryDelay = 5 * time.Millisecond
+	c.MinInterval = 0 // tests opt in to spacing explicitly
 	return c, &hits
 }
 
@@ -218,14 +221,81 @@ func TestRDAPClientRetriesAfter429(t *testing.T) {
 	}
 }
 
-func TestRDAPClientGivesUpWithRateLimitedResult(t *testing.T) {
-	c, hits := rateLimitFixture(t, 100, "")
+func TestRDAPClientGivesUpWithRateLimitedResultAfterMaxWait(t *testing.T) {
+	c, hits := rateLimitFixture(t, 1000, "")
+	c.MaxBackoff = 20 * time.Millisecond
+	c.MaxWait = 80 * time.Millisecond
+	start := time.Now()
 	got, err := c.Lookup(context.Background(), "taken.li")
 	if got != RDAPRateLimited || err == nil {
 		t.Fatalf("got %v, %v; want RDAPRateLimited with an error", got, err)
 	}
-	if hits.Load() != 3 {
-		t.Fatalf("requests = %d, want 3 (1 try + 2 retries)", hits.Load())
+	if hits.Load() < 2 {
+		t.Fatalf("requests = %d, want it to keep retrying while waiting", hits.Load())
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Fatalf("gave up after %v, MaxWait was 80ms", el)
+	}
+}
+
+func TestRDAPClientBackoffIsSharedAndEscalatesOnlyOncePerBlock(t *testing.T) {
+	c, hits := rateLimitFixture(t, 1, "")
+	c.RetryDelay = 60 * time.Millisecond
+	c.MaxBackoff = time.Second
+	start := time.Now()
+	done := make(chan RDAPResult, 4)
+	for i := 0; i < 4; i++ { // four "workers" hit the same server at once
+		go func() { r, _ := c.Lookup(context.Background(), "taken.li"); done <- r }()
+	}
+	for i := 0; i < 4; i++ {
+		if r := <-done; r != RDAPFound {
+			t.Fatalf("lookup %d = %v, want Found after the shared pause", i, r)
+		}
+	}
+	if el := time.Since(start); el < 60*time.Millisecond {
+		t.Fatalf("finished in %v: workers did not honour the shared pause", el)
+	}
+	if el := time.Since(start); el > 500*time.Millisecond {
+		t.Fatalf("finished in %v: concurrent 429s escalated the backoff instead of sharing it", el)
+	}
+	if hits.Load() > 8 {
+		t.Fatalf("%d requests: workers kept hammering a rate-limited server", hits.Load())
+	}
+}
+
+func TestRDAPClientResetsBackoffAfterSuccess(t *testing.T) {
+	c, _ := rateLimitFixture(t, 1, "")
+	c.RetryDelay = 10 * time.Millisecond
+	if r, _ := c.Lookup(context.Background(), "taken.li"); r != RDAPFound {
+		t.Fatalf("lookup = %v", r)
+	}
+	for base, st := range c.next {
+		if st.penalty != 0 {
+			t.Fatalf("penalty for %s = %v after a success, want 0", base, st.penalty)
+		}
+	}
+}
+
+func TestRDAPClientReportsThrottling(t *testing.T) {
+	c, _ := rateLimitFixture(t, 1, "")
+	c.RetryDelay = 10 * time.Millisecond
+	var calls atomic.Int32
+	var gotWait atomic.Int64
+	c.OnThrottle = func(base string, wait time.Duration) { calls.Add(1); gotWait.Store(int64(wait)) }
+	c.Lookup(context.Background(), "taken.li")
+	if calls.Load() != 1 || time.Duration(gotWait.Load()) != 10*time.Millisecond {
+		t.Fatalf("OnThrottle calls=%d wait=%v, want one call announcing the 10ms pause", calls.Load(), time.Duration(gotWait.Load()))
+	}
+}
+
+func TestRDAPClientHonoursRetryAfterHeader(t *testing.T) {
+	c, _ := rateLimitFixture(t, 1, "1")
+	c.RetryDelay = time.Millisecond
+	c.MaxBackoff = 5 * time.Second
+	start := time.Now()
+	c.Lookup(context.Background(), "taken.li")
+	if el := time.Since(start); el < 900*time.Millisecond {
+		t.Fatalf("Retry-After: 1 honoured only for %v", el)
 	}
 }
 

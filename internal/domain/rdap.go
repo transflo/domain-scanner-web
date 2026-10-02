@@ -30,11 +30,6 @@ const (
 )
 
 const (
-	maxRateLimitRetries = 2
-	maxRetryAfter       = 10 * time.Second
-)
-
-const (
 	defaultBootstrapURL = "https://data.iana.org/rdap/dns.json"
 	rdapUserAgent       = "domain-scanner-web/1.0 (+https://github.com/xuemian168/domain-scanner)"
 )
@@ -52,15 +47,30 @@ type RDAPClient struct {
 	// MinInterval is the minimum spacing between requests to the same RDAP server, shared by all
 	// workers, so a burst of parallel scans does not trip the registry's rate limit.
 	MinInterval time.Duration
-	// RetryDelay is used after a 429 that carries no usable Retry-After header.
+	// RetryDelay is the first pause after a 429. Further 429s double it up to MaxBackoff; a
+	// successful answer resets it. The pause applies to every caller of that server, so parallel
+	// workers back off together instead of each hammering a rate-limited registry.
 	RetryDelay time.Duration
+	MaxBackoff time.Duration
+	// MaxWait bounds how long one Lookup keeps waiting out rate limits before giving up with
+	// RDAPRateLimited (the domain is then reported as unknown).
+	MaxWait time.Duration
+	// OnThrottle, if set, is told whenever a server starts a new pause (for logging).
+	OnThrottle func(base string, wait time.Duration)
 
 	mu      sync.Mutex
 	servers map[string]string
 	fetched time.Time
 
 	limMu sync.Mutex
-	next  map[string]time.Time
+	next  map[string]*serverState
+}
+
+// serverState is the shared pacing state for one RDAP server.
+type serverState struct {
+	next         time.Time     // earliest start of the next request
+	blockedUntil time.Time     // pause requested by the server (429)
+	penalty      time.Duration // current backoff, 0 when healthy
 }
 
 // defaultRDAPServers are ccTLD/gTLD RDAP endpoints that are absent from the IANA bootstrap
@@ -92,27 +102,80 @@ func NewRDAPClient() *RDAPClient {
 		BootstrapTTL: 24 * time.Hour,
 		Overrides:    overrides,
 		MinInterval:  250 * time.Millisecond,
-		RetryDelay:   2 * time.Second,
-		next:         map[string]time.Time{},
+		RetryDelay:   5 * time.Second,
+		MaxBackoff:   5 * time.Minute,
+		MaxWait:      10 * time.Minute,
+		next:         map[string]*serverState{},
 	}
 }
 
-// waitTurn blocks until this client may send the next request to base.
-func (c *RDAPClient) waitTurn(ctx context.Context, base string) error {
-	if c.MinInterval <= 0 {
-		return nil
-	}
-	c.limMu.Lock()
+// state returns the pacing state for base; the caller must hold limMu.
+func (c *RDAPClient) state(base string) *serverState {
 	if c.next == nil {
-		c.next = map[string]time.Time{}
+		c.next = map[string]*serverState{}
 	}
-	at := c.next[base]
-	if now := time.Now(); at.Before(now) {
-		at = now
+	st := c.next[base]
+	if st == nil {
+		st = &serverState{}
+		c.next[base] = st
 	}
-	c.next[base] = at.Add(c.MinInterval)
+	return st
+}
+
+// waitTurn blocks until this client may send the next request to base: after any server-imposed
+// pause and at least MinInterval after the previous request.
+func (c *RDAPClient) waitTurn(ctx context.Context, base string) error {
+	c.limMu.Lock()
+	st := c.state(base)
+	at := time.Now()
+	if st.next.After(at) {
+		at = st.next
+	}
+	if st.blockedUntil.After(at) {
+		at = st.blockedUntil
+	}
+	st.next = at.Add(c.MinInterval)
 	c.limMu.Unlock()
 	return sleepCtx(ctx, time.Until(at))
+}
+
+// throttle records a 429 from base and returns how long callers must now wait. Concurrent 429s
+// that arrive during an existing pause share it rather than escalating the backoff again.
+func (c *RDAPClient) throttle(base string, h http.Header) time.Duration {
+	c.limMu.Lock()
+	st := c.state(base)
+	now := time.Now()
+	if now.Before(st.blockedUntil) {
+		wait := st.blockedUntil.Sub(now)
+		c.limMu.Unlock()
+		return wait
+	}
+	wait := st.penalty * 2
+	if wait < c.RetryDelay {
+		wait = c.RetryDelay
+	}
+	if s, err := strconv.Atoi(strings.TrimSpace(h.Get("Retry-After"))); err == nil && s > 0 {
+		if ra := time.Duration(s) * time.Second; ra > wait {
+			wait = ra
+		}
+	}
+	if c.MaxBackoff > 0 && wait > c.MaxBackoff {
+		wait = c.MaxBackoff
+	}
+	st.penalty = wait
+	st.blockedUntil = now.Add(wait)
+	c.limMu.Unlock()
+	if c.OnThrottle != nil {
+		c.OnThrottle(base, wait)
+	}
+	return wait
+}
+
+// recovered clears the backoff after a normal answer.
+func (c *RDAPClient) recovered(base string) {
+	c.limMu.Lock()
+	c.state(base).penalty = 0
+	c.limMu.Unlock()
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -127,18 +190,6 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-// retryDelay honours a numeric Retry-After header (capped), else the configured default.
-func (c *RDAPClient) retryDelay(h http.Header) time.Duration {
-	if s, err := strconv.Atoi(strings.TrimSpace(h.Get("Retry-After"))); err == nil && s >= 0 {
-		d := time.Duration(s) * time.Second
-		if d > maxRetryAfter {
-			d = maxRetryAfter
-		}
-		return d
-	}
-	return c.RetryDelay
 }
 
 // Lookup asks the TLD's RDAP server about domain.
@@ -160,7 +211,8 @@ func (c *RDAPClient) Lookup(ctx context.Context, domain string) (RDAPResult, err
 		}
 	}
 
-	for attempt := 0; ; attempt++ {
+	start := time.Now()
+	for {
 		if err := c.waitTurn(ctx, base); err != nil {
 			return RDAPError, err
 		}
@@ -179,16 +231,18 @@ func (c *RDAPClient) Lookup(ctx context.Context, domain string) (RDAPResult, err
 
 		switch resp.StatusCode {
 		case http.StatusOK:
+			c.recovered(base)
 			return RDAPFound, nil
 		case http.StatusNotFound:
+			c.recovered(base)
 			return RDAPNotFound, nil
 		case http.StatusTooManyRequests:
-			if attempt >= maxRateLimitRetries {
-				return RDAPRateLimited, fmt.Errorf("rdap %s: HTTP 429 (rate limited)", base)
+			wait := c.throttle(base, resp.Header)
+			if c.MaxWait > 0 && time.Since(start)+wait > c.MaxWait {
+				return RDAPRateLimited, fmt.Errorf("rdap %s: HTTP 429 (rate limited, gave up after %s)",
+					base, time.Since(start).Round(time.Second))
 			}
-			if err := sleepCtx(ctx, c.retryDelay(resp.Header)); err != nil {
-				return RDAPError, err
-			}
+			// loop: waitTurn sleeps out the pause, then the request is retried
 		default:
 			return RDAPError, fmt.Errorf("rdap %s: HTTP %d", base, resp.StatusCode)
 		}
