@@ -6,8 +6,26 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scanner ./cmd/server
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates wget tzdata \
- && addgroup -S app && adduser -S app -G app
+ARG TARGETARCH
+# xray-core powers the outbound proxies. The release archive is verified against the SHA-256
+# published next to it before anything is installed.
+ARG XRAY_VERSION=v26.3.27
+RUN apk add --no-cache ca-certificates wget tzdata unzip \
+ && addgroup -S app && adduser -S app -G app \
+ && case "${TARGETARCH:-amd64}" in \
+      amd64) XARCH=64 ;; \
+      arm64) XARCH=arm64-v8a ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && wget -q -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${XARCH}.zip" \
+ && wget -q -O /tmp/xray.dgst "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${XARCH}.zip.dgst" \
+ && want="$(sed -n 's/^SHA2-256= *//p' /tmp/xray.dgst | tr -d '\r')" \
+ && have="$(sha256sum /tmp/xray.zip | cut -d' ' -f1)" \
+ && [ -n "$want" ] && [ "$want" = "$have" ] || { echo "xray checksum mismatch: want=$want have=$have" >&2; exit 1; } \
+ && unzip -q /tmp/xray.zip xray -d /usr/local/bin \
+ && chmod 755 /usr/local/bin/xray \
+ && rm -f /tmp/xray.zip /tmp/xray.dgst \
+ && /usr/local/bin/xray version | head -1
 WORKDIR /app
 # Built-in dictionaries (popular open-source word lists) are baked into the image.
 COPY scripts/fetch-wordlists.sh /tmp/fetch-wordlists.sh
@@ -15,7 +33,7 @@ RUN sed -i 's/\r$//' /tmp/fetch-wordlists.sh && sh /tmp/fetch-wordlists.sh /app/
 COPY --from=build /out/scanner /app/scanner
 RUN mkdir -p /data && chown app:app /data
 USER app
-ENV DATA_DIR=/data WORDLIST_DIR=/app/wordlists LISTEN_ADDR=:8080
+ENV DATA_DIR=/data WORDLIST_DIR=/app/wordlists LISTEN_ADDR=:8080 XRAY_BIN=/usr/local/bin/xray
 VOLUME /data
 EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=5 \

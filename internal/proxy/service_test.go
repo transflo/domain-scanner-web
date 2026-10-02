@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,6 +97,34 @@ func TestTestAllSavesResultsAndUpdatesHealth(t *testing.T) {
 	}
 	if got := e.reg.Candidates(false); len(got) != 0 {
 		t.Fatalf("a failing proxy must not be offered: %v", got)
+	}
+}
+
+func TestReloadIsolatesAnOutboundXrayRejects(t *testing.T) {
+	e := newSvc(t)
+	e.svc.Mgr.Tester = rejectingTester("BADUUID", "Failed to start: infra/conf: invalid UUID: BADUUID")
+	good1 := e.add(t, "good-1", true)
+	bad, _ := e.st.CreateOutbound(context.Background(), &store.Outbound{Name: "bad", Protocol: "vless", Address: "b.example", Port: 443,
+		Config: json.RawMessage(`{"protocol":"vless","settings":{"address":"b.example","port":443,"id":"BADUUID"}}`), Enabled: true})
+	good2 := e.add(t, "good-2", true)
+
+	if err := e.svc.Reload(context.Background()); err != nil {
+		t.Fatalf("one bad outbound must not break the others: %v", err)
+	}
+	for _, id := range []int64{good1, good2} {
+		if _, ok := e.reg.Get(egress.ProxyID(id)); !ok {
+			t.Fatalf("good outbound %d is not usable", id)
+		}
+	}
+	if _, ok := e.reg.Get(egress.ProxyID(bad)); ok {
+		t.Fatal("the rejected outbound must not be registered")
+	}
+	o, _ := e.st.GetOutbound(context.Background(), bad)
+	if o.LastOK || !strings.Contains(o.LastError, "invalid UUID") {
+		t.Fatalf("the reason must be stored so the UI can show it: %+v", o)
+	}
+	if e.f.started.Load() != 1 {
+		t.Fatalf("xray started %d times, want one process for the good outbounds", e.f.started.Load())
 	}
 }
 

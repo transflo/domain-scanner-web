@@ -16,3 +16,5 @@ registered_domains_*.txt
 # local tooling output
 .playwright-mcp/
 /*.png
+
+.tmp/

@@ -27,6 +27,106 @@ type Process interface {
 	Stop()
 }
 
+// Tester validates a configuration file without running it (`xray run -test -c file`) and
+// returns xray's own output. Replaceable for tests; nil skips the precheck.
+type Tester func(ctx context.Context, bin, cfgPath string) (output string, err error)
+
+// ConfigError means xray itself rejected the configuration; Message is xray's reason.
+type ConfigError struct{ Message string }
+
+func (e *ConfigError) Error() string { return "xray 拒绝了配置:" + e.Message }
+
+// Wrapper segments of xray's error chain that say nothing about the cause.
+var chainNoise = []string{"failed to load config files", "failed to build outbound config", "failed to build stream settings"}
+
+// summarize reduces `xray run -test` output to its reason. Xray reports a rejected config as one
+// line, "Failed to start: main: ... > infra/conf: ... > infra/conf: <root cause>"; the wrapper
+// segments are dropped and the cause (with its immediate context) is kept.
+func summarize(out string) string {
+	var chain string
+	var plain []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "" || strings.Contains(line, "Reading config") || strings.HasPrefix(line, "A unified platform") ||
+			strings.HasPrefix(line, "Xray ") || strings.Contains(line, "[Info]") || strings.Contains(line, "[Warning]"):
+		case strings.HasPrefix(line, "Failed to start:") || (strings.Contains(line, " > ") && strings.Contains(line, "infra/conf:")):
+			chain = line
+		default:
+			plain = append(plain, line)
+		}
+	}
+	var s string
+	if chain != "" {
+		var keep []string
+		for _, seg := range strings.Split(strings.TrimPrefix(chain, "Failed to start:"), " > ") {
+			seg = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(seg), "infra/conf:"))
+			skip := seg == "" || strings.HasPrefix(seg, "main:")
+			for _, n := range chainNoise {
+				if strings.Contains(seg, n) {
+					skip = true
+				}
+			}
+			if !skip {
+				keep = append(keep, seg)
+			}
+		}
+		s = strings.Join(keep, " → ")
+	} else {
+		if len(plain) > 3 {
+			plain = plain[len(plain)-3:]
+		}
+		s = strings.Join(plain, "; ")
+	}
+	if len(s) > 300 {
+		s = s[:300] + "…"
+	}
+	if s == "" {
+		s = "(xray 没有给出原因)"
+	}
+	return s
+}
+func execTest(ctx context.Context, bin, cfgPath string) (string, error) {
+	tctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(tctx, bin, "run", "-test", "-c", cfgPath).CombinedOutput()
+	return string(out), err
+}
+
+// precheck runs the Tester, if any, and turns a rejection into a *ConfigError.
+func (m *Manager) precheck(ctx context.Context, cfgPath string) error {
+	if m.Tester == nil {
+		return nil
+	}
+	out, err := m.Tester(ctx, m.Bin, cfgPath)
+	if err != nil {
+		return &ConfigError{Message: summarize(out)}
+	}
+	return nil
+}
+
+// CheckConfig asks xray whether it accepts one outbound, without starting anything.
+func (m *Manager) CheckConfig(ctx context.Context, cfg json.RawMessage) error {
+	raw, err := BuildSingle(cfg, 1)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(m.Dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(m.Dir, "check-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	_, werr := f.Write(raw)
+	f.Close()
+	if werr != nil {
+		return werr
+	}
+	return m.precheck(ctx, f.Name())
+}
+
 // Starter launches xray with a configuration file. logf receives every output line of the
 // process with a level guessed from Xray's "[Warning]"-style prefix. Replaceable for tests.
 type Starter func(ctx context.Context, bin, cfgPath string, logf func(level, line string)) (Process, error)
@@ -44,6 +144,7 @@ type Manager struct {
 	Dir      string
 	BasePort int
 	Starter  Starter
+	Tester   Tester
 	// RestartBackoff is the first wait before reviving a crashed process (doubles up to 30s).
 	RestartBackoff time.Duration
 	// SkipBinaryCheck lets tests run with a fake Starter and no xray binary on disk.
@@ -61,7 +162,7 @@ type Manager struct {
 }
 
 func NewManager(bin, dir string, lg *logbus.Logger) *Manager {
-	return &Manager{Bin: bin, Dir: dir, BasePort: BasePort, Starter: execStart, RestartBackoff: time.Second,
+	return &Manager{Bin: bin, Dir: dir, BasePort: BasePort, Starter: execStart, Tester: execTest, RestartBackoff: time.Second,
 		lg: lg, testSem: make(chan struct{}, 2), ports: map[int64]int{}}
 }
 
@@ -144,6 +245,11 @@ func (m *Manager) Apply(ctx context.Context, entries []Entry) (map[int64]int, er
 	cfgPath := filepath.Join(m.Dir, "config.json")
 	if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
 		m.setErr(err.Error())
+		return nil, err
+	}
+	if err := m.precheck(ctx, cfgPath); err != nil {
+		m.setErr(err.Error())
+		m.lg.Error("config_rejected", 0, err.Error(), logbus.Fields{"outbounds": len(entries)})
 		return nil, err
 	}
 
@@ -325,6 +431,13 @@ func (m *Manager) TestConfig(ctx context.Context, cfg json.RawMessage, o ProbeOp
 		return ProbeResult{Error: err.Error()}
 	}
 	f.Close()
+	if err := m.precheck(ctx, f.Name()); err != nil {
+		var ce *ConfigError
+		if errors.As(err, &ce) {
+			return ProbeResult{Error: "xray 拒绝了这份配置:" + ce.Message}
+		}
+		return ProbeResult{Error: err.Error()}
+	}
 
 	pctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()

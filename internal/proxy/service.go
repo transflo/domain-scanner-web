@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -66,6 +67,16 @@ func (s *Service) Reload(ctx context.Context) error {
 		}
 	}
 	ports, err := s.Mgr.Apply(ctx, entries)
+	var cfgErr *ConfigError
+	if errors.As(err, &cfgErr) && len(entries) > 1 {
+		// xray refused the combined configuration: find the culprit(s), keep the rest running
+		entries, err = s.dropRejected(ctx, entries, byID)
+		if err == nil {
+			ports, err = s.Mgr.Apply(ctx, entries)
+		}
+	} else if errors.As(err, &cfgErr) {
+		_ = s.St.SaveOutboundTest(ctx, entries[0].ID, false, 0, cfgErr.Message, "", "")
+	}
 	if err != nil {
 		s.Reg.Replace(nil)
 		s.Log.Error("reload_failed", 0, "出站代理重载失败,代理池已清空:"+err.Error(), logbus.Fields{"error": err.Error(), "outbounds": len(entries)})
@@ -80,6 +91,29 @@ func (s *Service) Reload(ctx context.Context) error {
 	s.Log.Info("reloaded", 0, fmt.Sprintf("出站代理已重载:%d 个启用(共 %d 个)", len(entries), len(list)),
 		logbus.Fields{"enabled": len(entries), "total": len(list)})
 	return nil
+}
+
+// dropRejected checks every entry on its own with xray's config test, records why the rejected
+// ones failed, and returns the entries xray accepts.
+func (s *Service) dropRejected(ctx context.Context, entries []Entry, byID map[int64]store.Outbound) ([]Entry, error) {
+	var good []Entry
+	for _, e := range entries {
+		err := s.Mgr.CheckConfig(ctx, e.Config)
+		if err == nil {
+			good = append(good, e)
+			continue
+		}
+		msg := err.Error()
+		var ce *ConfigError
+		if errors.As(err, &ce) {
+			msg = ce.Message
+		}
+		_ = s.St.SaveOutboundTest(ctx, e.ID, false, 0, "xray 拒绝了配置:"+msg, "", "")
+		s.Reg.Replace(nil) // never leave a stale view behind while the set changes
+		s.Log.Warn("rejected", 0, fmt.Sprintf("出站代理「%s」被 xray 拒绝,已跳过:%s", byID[e.ID].Name, msg),
+			logbus.Fields{"id": e.ID, "error": msg})
+	}
+	return good, nil
 }
 
 // TestOne tests one stored outbound, saves the result and updates the registry's health view.

@@ -11,9 +11,17 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请在 .env 中设置 ADMIN_PASSWORD(至少 8 位)}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-      MAX_PARALLEL_JOBS: ${MAX_PARALLEL_JOBS:-2}
+      # Cloudflare Registrar: final availability check + the Telegram "register" button.
+      # Can also be set in the web UI (settings page), which takes precedence.
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      # Cap on concurrently running jobs that go through proxies. 0 = unlimited. Jobs on the
+      # direct connection are never limited.
+      MAX_PARALLEL_JOBS: ${MAX_PARALLEL_JOBS:-0}
       # Extra "tld=https://rdap.example/" pairs, comma separated (see README).
       RDAP_SERVERS: ${RDAP_SERVERS:-}
+      # Lowest level printed by `docker compose logs`; the database keeps everything (see the UI).
+      LOG_STDOUT_LEVEL: ${LOG_STDOUT_LEVEL:-info}
       # The only client of this port is the web container, which appends the real client IP.
       TRUST_PROXY: "true"
     volumes:
@@ -30,7 +38,7 @@ services:
       scanner:
         condition: service_healthy
     ports:
-      - "${WEB_PORT:-3000}:3000"
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-3000}:3000"
 
 volumes:
   scanner-data:

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -108,6 +109,7 @@ func newManager(t *testing.T) (*Manager, *fakeStarter) {
 	f := &fakeStarter{t: t}
 	m := NewManager("/usr/local/bin/xray", t.TempDir(), bus.Logger("xray"))
 	m.Starter = f.start
+	m.Tester = nil // no xray binary in unit tests; individual tests install a fake Tester
 	m.BasePort = freeBase(t)
 	m.RestartBackoff = 20 * time.Millisecond
 	m.SkipBinaryCheck = true
@@ -269,6 +271,62 @@ func TestTestConfigUsesATemporaryInstance(t *testing.T) {
 	}
 	if m.Running() {
 		t.Fatal("testing a config must not disturb the main instance")
+	}
+}
+
+// rejectingTester fails any config containing the marker, like `xray run -test` would.
+func rejectingTester(marker, message string) Tester {
+	return func(ctx context.Context, bin, cfgPath string) (string, error) {
+		raw, err := os.ReadFile(cfgPath)
+		if err != nil {
+			return "", err
+		}
+		if strings.Contains(string(raw), marker) {
+			return message, errors.New("exit status 23")
+		}
+		return "Configuration OK.", nil
+	}
+}
+
+func TestApplyPrechecksTheConfigAndReportsXraysOwnMessage(t *testing.T) {
+	m, f := newManager(t)
+	m.Tester = rejectingTester("BADUUID", "Failed to start: infra/conf: invalid UUID: BADUUID")
+	bad := `{"protocol":"vless","settings":{"address":"a.example","port":443,"id":"BADUUID"}}`
+	_, err := m.Apply(context.Background(), []Entry{entry(1, bad)})
+	var ce *ConfigError
+	if !errors.As(err, &ce) || !strings.Contains(ce.Message, "invalid UUID") {
+		t.Fatalf("err = %v, want a *ConfigError carrying xray's message", err)
+	}
+	if f.started.Load() != 0 {
+		t.Fatal("a rejected config must never be started")
+	}
+	if !strings.Contains(m.LastError(), "invalid UUID") {
+		t.Fatalf("LastError = %q", m.LastError())
+	}
+}
+
+func TestTestConfigFailsFastWithXraysMessage(t *testing.T) {
+	m, f := newManager(t)
+	m.Tester = rejectingTester("BADUUID", "Failed to start: infra/conf: invalid UUID: BADUUID")
+	bad := `{"protocol":"vless","settings":{"address":"a.example","port":443,"id":"BADUUID"}}`
+	start := time.Now()
+	r := m.TestConfig(context.Background(), json.RawMessage(bad), ProbeOptions{})
+	if r.OK || !strings.Contains(r.Error, "invalid UUID") {
+		t.Fatalf("result = %+v", r)
+	}
+	if time.Since(start) > 2*time.Second || f.started.Load() != 0 {
+		t.Fatalf("took %v / started %d; the precheck must reject before any process is spawned", time.Since(start), f.started.Load())
+	}
+}
+
+func TestCheckConfigAcceptsGoodAndRejectsBad(t *testing.T) {
+	m, _ := newManager(t)
+	m.Tester = rejectingTester("BADUUID", "nope")
+	if err := m.CheckConfig(context.Background(), json.RawMessage(vlessCfg)); err != nil {
+		t.Fatalf("good config: %v", err)
+	}
+	if err := m.CheckConfig(context.Background(), json.RawMessage(`{"protocol":"vless","settings":{"id":"BADUUID"}}`)); err == nil {
+		t.Fatal("bad config accepted")
 	}
 }
 
