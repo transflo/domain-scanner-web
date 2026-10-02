@@ -72,6 +72,7 @@ var upgrades = []struct{ table, column, ddl string }{
 	{"results", "cf_checked_at", "INTEGER NOT NULL DEFAULT 0"},
 	{"results", "register_status", "TEXT NOT NULL DEFAULT ''"},
 	{"results", "register_note", "TEXT NOT NULL DEFAULT ''"},
+	{"results", "register_at", "INTEGER NOT NULL DEFAULT 0"},
 	// structured logs
 	{"logs", "component", "TEXT NOT NULL DEFAULT ''"},
 	{"logs", "event", "TEXT NOT NULL DEFAULT ''"},

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -45,6 +46,7 @@ type Deps struct {
 	Words            WordlistMgr
 	Telegram         TelegramTester
 	Proxy            ProxyService
+	Cloudflare       CloudflareTester
 	Auth             *auth.Auth
 	TelegramEnv      notifier.Config // fallback when nothing is saved in settings
 	CloudflareEnv    appsettings.Cloudflare
@@ -78,6 +80,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/logs/stream", a.streamLogs)
 	mux.HandleFunc("GET /api/logs/export", a.exportLogs)
 	mux.HandleFunc("GET /api/logs/components", a.logComponents)
+	mux.HandleFunc("GET /api/diagnostics", a.diagnostics)
 	mux.HandleFunc("GET /api/outbounds", a.listOutbounds)
 	mux.HandleFunc("POST /api/outbounds", a.createOutbound)
 	mux.HandleFunc("POST /api/outbounds/import", a.importOutbounds)
@@ -94,9 +97,10 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/settings", a.getSettings)
 	mux.HandleFunc("PUT /api/settings", a.putSettings)
 	mux.HandleFunc("POST /api/settings/telegram/test", a.testTelegram)
+	mux.HandleFunc("POST /api/settings/cloudflare/test", a.testCloudflare)
 
 	protected := d.Auth.Middleware(mux, "/api/health", "/api/auth/login", "/api/auth/logout", "/api/auth/me")
-	return jsonErrors(protected)
+	return jsonErrors(a.accessLog(protected))
 }
 
 // ---- helpers ----
@@ -121,7 +125,7 @@ func (a *api) fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not found")
 	default:
-		a.Bus.Log("error", 0, "API 内部错误:%v", err)
+		a.Bus.Logger("http").Error("internal_error", 0, fmt.Sprintf("API 内部错误:%v", err), map[string]any{"error": err.Error()})
 		writeErr(w, http.StatusInternalServerError, "internal error")
 	}
 }

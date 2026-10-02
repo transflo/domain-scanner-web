@@ -85,15 +85,29 @@ func (h *proxyHolder) TestConfig(ctx context.Context, cfg []byte) proxy.ProbeRes
 }
 func (h *proxyHolder) Status() proxy.Status { return h.get().Status() }
 
+type cfHolder struct {
+	mu    sync.Mutex
+	inner CloudflareTester
+}
+
+func (h *cfHolder) set(c CloudflareTester) { h.mu.Lock(); h.inner = c; h.mu.Unlock() }
+func (h *cfHolder) Verify(ctx context.Context) error {
+	h.mu.Lock()
+	in := h.inner
+	h.mu.Unlock()
+	return in.Verify(ctx)
+}
+
 type fixture struct {
-	srv   *httptest.Server
-	st    *store.Store
-	bus   *logbus.Bus
-	sched *fakeSched
-	tg    *fakeTG
-	auth  *auth.Auth
-	words *wordlists.Manager
-	proxy *proxyHolder
+	srv    *httptest.Server
+	st     *store.Store
+	bus    *logbus.Bus
+	sched  *fakeSched
+	tg     *fakeTG
+	auth   *auth.Auth
+	words  *wordlists.Manager
+	proxy  *proxyHolder
+	cfTest *cfHolder
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -110,8 +124,8 @@ func newFixture(t *testing.T) *fixture {
 	}
 	f := &fixture{st: st, bus: bus, auth: a, sched: &fakeSched{st: st}, tg: &fakeTG{},
 		words: wordlists.NewManager(filepath.Join(dir, "builtin"), filepath.Join(dir, "user")),
-		proxy: &proxyHolder{inner: &fakeProxy{}}}
-	h := New(Deps{Store: st, Bus: bus, Sched: f.sched, Words: f.words, Telegram: f.tg, Auth: a, Proxy: f.proxy,
+		proxy: &proxyHolder{inner: &fakeProxy{}}, cfTest: &cfHolder{inner: fakeCFTester{}}}
+	h := New(Deps{Store: st, Bus: bus, Sched: f.sched, Words: f.words, Telegram: f.tg, Auth: a, Proxy: f.proxy, Cloudflare: f.cfTest,
 		TelegramEnv: notifier.Config{}, MaxWordlistBytes: 1 << 20})
 	f.srv = httptest.NewServer(h)
 	t.Cleanup(func() { f.srv.Close(); bus.Close(); st.Close() })
@@ -457,6 +471,205 @@ func TestSavedSecretsAreRedactedFromLogs(t *testing.T) {
 	last := f.bus.Recent(1, "", 0)[0]
 	if strings.Contains(last.Message, "AAHdummy") {
 		t.Fatalf("a saved token reached the logs: %q", last.Message)
+	}
+}
+
+func TestCloudflareSettingsAreMaskedValidatedAndRegistrationPolicyRoundTrips(t *testing.T) {
+	f := newFixture(t)
+	c := f.login(t)
+	const acct = "0123456789abcdef0123456789abcdef"
+	const tok = "cfat_SECRETSECRETSECRETSECRETSECRET1234"
+
+	resp := f.do(t, c, "PUT", "/api/settings", map[string]any{
+		"cloudflare_account_id": acct, "cloudflare_token": tok,
+		"register_confirm": false, "register_max_price": "12.5", "register_daily_cap": 3, "push_unconfirmed": false})
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || strings.Contains(string(raw), "SECRETSECRET") {
+		t.Fatalf("PUT = %d, body must not echo the token: %s", resp.StatusCode, raw)
+	}
+	var s struct {
+		Acct       string `json:"cloudflare_account_id"`
+		Token      string `json:"cloudflare_token"`
+		Configured bool   `json:"cloudflare_configured"`
+		Confirm    bool   `json:"register_confirm"`
+		MaxPrice   string `json:"register_max_price"`
+		Cap        int    `json:"register_daily_cap"`
+		Unconfirm  bool   `json:"push_unconfirmed"`
+	}
+	json.Unmarshal(raw, &s)
+	if s.Acct != acct || !strings.HasSuffix(s.Token, "1234") || !strings.HasPrefix(s.Token, "****") || !s.Configured ||
+		s.Confirm || s.MaxPrice != "12.5" || s.Cap != 3 || s.Unconfirm {
+		t.Fatalf("settings = %+v", s)
+	}
+	// echoing the mask must keep the stored token
+	resp = f.do(t, c, "PUT", "/api/settings", map[string]any{"cloudflare_token": s.Token, "register_daily_cap": 4})
+	resp.Body.Close()
+	if stored, _, _ := f.st.GetSetting(context.Background(), "cloudflare_token"); stored != tok {
+		t.Fatalf("mask overwrote the token: %q", stored)
+	}
+	// the token must never reach the logs
+	f.bus.Log("info", 0, "using "+tok)
+	if strings.Contains(f.bus.Recent(1, "", 0)[0].Message, "SECRETSECRET") {
+		t.Fatal("cloudflare token reached the logs")
+	}
+
+	for name, body := range map[string]map[string]any{
+		"short account id":   {"cloudflare_account_id": "abc"},
+		"weird token":        {"cloudflare_token": "has spaces and !!"},
+		"negative price":     {"register_max_price": "-1"},
+		"price not a number": {"register_max_price": "cheap"},
+		"cap too large":      {"register_daily_cap": 5000},
+		"negative cap":       {"register_daily_cap": -2},
+	} {
+		resp = f.do(t, c, "PUT", "/api/settings", body)
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Errorf("%s: PUT = %d, want 400", name, resp.StatusCode)
+		}
+	}
+}
+
+type fakeCFTester struct{ err error }
+
+func (f fakeCFTester) Verify(context.Context) error { return f.err }
+
+func TestCloudflareTestEndpoint(t *testing.T) {
+	f := newFixture(t)
+	c := f.login(t)
+	f.cfTest.set(fakeCFTester{})
+	resp := f.do(t, c, "POST", "/api/settings/cloudflare/test", nil)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("ok case = %d", resp.StatusCode)
+	}
+	f.cfTest.set(fakeCFTester{err: errors.New("Token 状态为 disabled")})
+	resp = f.do(t, c, "POST", "/api/settings/cloudflare/test", nil)
+	var e map[string]string
+	decode(t, resp, &e)
+	if resp.StatusCode != 502 || !strings.Contains(e["error"], "disabled") {
+		t.Fatalf("failure case = %d %v", resp.StatusCode, e)
+	}
+}
+
+func TestResultsCloudflareFilterAndCSVColumns(t *testing.T) {
+	f := newFixture(t)
+	c := f.login(t)
+	ctx := context.Background()
+	jid, _ := f.st.CreateJob(ctx, &store.Job{Name: "j", Suffix: ".com", Workers: 1, Status: "done"})
+	a := &store.Result{JobID: jid, Domain: "ok.com", Status: "available"}
+	b := &store.Result{JobID: jid, Domain: "no.com", Status: "available"}
+	f.st.InsertResult(ctx, a)
+	f.st.InsertResult(ctx, b)
+	f.st.UpdateResultCF(ctx, a.ID, store.CFUpdate{Status: "confirmed", Price: "10.46", Currency: "USD"})
+	f.st.UpdateResultCF(ctx, b.ID, store.CFUpdate{Status: "rejected", Reason: "domain_unavailable"})
+
+	resp := f.do(t, c, "GET", "/api/results?cf_status=confirmed", nil)
+	var out struct {
+		Items []store.Result `json:"items"`
+		Total int64          `json:"total"`
+	}
+	decode(t, resp, &out)
+	if out.Total != 1 || out.Items[0].Domain != "ok.com" || out.Items[0].CFPrice != "10.46" {
+		t.Fatalf("filtered = %+v", out)
+	}
+
+	resp = f.do(t, c, "GET", "/api/results/export", nil)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	csv := string(body)
+	if !strings.HasPrefix(csv, "domain,status,job_id,signatures,found_at,cloudflare,price,currency,registration") ||
+		!strings.Contains(csv, "ok.com,available") || !strings.Contains(csv, "confirmed,10.46,USD") ||
+		!strings.Contains(csv, "rejected:domain_unavailable") {
+		t.Fatalf("csv = %q", csv)
+	}
+}
+
+func TestAccessLogRecordsRequestsWithoutSecrets(t *testing.T) {
+	f := newFixture(t)
+	c := f.login(t) // POST /api/auth/login with the real password
+	resp := f.do(t, c, "GET", "/api/stats", nil)
+	resp.Body.Close()
+	resp = f.do(t, f.client(t), "GET", "/api/jobs", nil) // unauthenticated -> 401
+	resp.Body.Close()
+	resp = f.do(t, c, "GET", "/api/health", nil)
+	resp.Body.Close()
+
+	var login, stats, denied *store.LogEntry
+	health := 0
+	for _, e := range f.bus.Recent(100, "debug", 0) {
+		e := e
+		if e.Component != "http" {
+			continue
+		}
+		switch {
+		case strings.Contains(e.Message, "/api/auth/login"):
+			login = &e
+		case strings.Contains(e.Message, "/api/stats"):
+			stats = &e
+		case strings.Contains(e.Message, "/api/jobs"):
+			denied = &e
+		case strings.Contains(e.Message, "/api/health"):
+			health++
+		}
+	}
+	if login == nil || stats == nil || denied == nil {
+		t.Fatalf("missing access log lines: login=%v stats=%v denied=%v", login, stats, denied)
+	}
+	if login.Level != "info" || login.Fields["status"] != 200 || login.Fields["method"] != "POST" {
+		t.Fatalf("login line = %+v", login)
+	}
+	if stats.Level != "debug" || stats.Fields["status"] != 200 {
+		t.Fatalf("a polled GET is debug noise: %+v", stats)
+	}
+	if denied.Level != "warn" || denied.Fields["status"] != 401 {
+		t.Fatalf("a 401 deserves a warning: %+v", denied)
+	}
+	if login.DurationMS < 0 || login.Fields["ip"] == nil {
+		t.Fatalf("duration/ip missing: %+v", login)
+	}
+	if health != 0 {
+		t.Fatal("health checks are noise and must not be logged")
+	}
+	for _, e := range f.bus.Recent(100, "debug", 0) {
+		if strings.Contains(e.Message, password) || strings.Contains(fmt.Sprint(e.Fields), password) {
+			t.Fatalf("the password reached the logs: %+v", e)
+		}
+	}
+}
+
+func TestDiagnosticsEndpoint(t *testing.T) {
+	f := newFixture(t)
+	c := f.login(t)
+	now := time.Now()
+	f.st.InsertLogs(context.Background(), []store.LogEntry{
+		{Level: "debug", Component: "check", Event: "done", Domain: "a.com", Egress: "direct", DurationMS: 120, Time: now, Message: "x",
+			Fields: map[string]any{"status": "available", "err_kind": ""}},
+		{Level: "debug", Component: "check", Event: "done", Domain: "b.li", Egress: "direct", DurationMS: 80, Time: now, Message: "y",
+			Fields: map[string]any{"status": "unknown", "err_kind": "rate_limited"}},
+	})
+	resp := f.do(t, c, "GET", "/api/diagnostics?hours=6", nil)
+	var d struct {
+		Diagnostics store.Diagnostics `json:"diagnostics"`
+		Logs        struct {
+			Count int64 `json:"count"`
+		} `json:"logs"`
+		Egresses []map[string]any `json:"egresses"`
+	}
+	decode(t, resp, &d)
+	if resp.StatusCode != 200 || d.Diagnostics.Checks != 2 || len(d.Diagnostics.ByEgress) != 1 ||
+		d.Diagnostics.ByEgress[0].RateLimited != 1 || d.Logs.Count != 2 || len(d.Egresses) != 1 {
+		t.Fatalf("diagnostics = %d %+v", resp.StatusCode, d)
+	}
+	for _, bad := range []string{"hours=0", "hours=abc", "hours=100000"} {
+		resp = f.do(t, c, "GET", "/api/diagnostics?"+bad, nil)
+		var ok struct {
+			Diagnostics store.Diagnostics `json:"diagnostics"`
+		}
+		decode(t, resp, &ok) // out-of-range values fall back to the default window rather than failing
+		if resp.StatusCode != 200 {
+			t.Errorf("%s = %d", bad, resp.StatusCode)
+		}
 	}
 }
 

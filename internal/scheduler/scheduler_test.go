@@ -92,15 +92,16 @@ type fakeNotifier struct {
 	seen map[string]int
 }
 
-func (n *fakeNotifier) Notify(job string, ds []string) {
+func (n *fakeNotifier) Found(h Hit) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.seen == nil {
 		n.seen = map[string]int{}
 	}
-	for _, d := range ds {
-		n.seen[d]++
+	if h.ResultID == 0 || h.JobID == 0 || h.JobName == "" {
+		panic("a Hit must carry the result id, job id and job name")
 	}
+	n.seen[h.Domain]++
 }
 
 func (n *fakeNotifier) count() (distinct, dups int) {

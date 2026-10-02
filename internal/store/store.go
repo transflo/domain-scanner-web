@@ -270,6 +270,11 @@ func (s *Store) InsertResult(ctx context.Context, r *Result) (bool, error) {
 		return false, err
 	}
 	n, err := res.RowsAffected()
+	if err == nil && n > 0 {
+		if id, err := res.LastInsertId(); err == nil {
+			r.ID = id
+		}
+	}
 	return n > 0, err
 }
 

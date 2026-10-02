@@ -228,6 +228,25 @@ func (a *api) putSettings(w http.ResponseWriter, r *http.Request) {
 	a.getSettings(w, r)
 }
 
+// CloudflareTester checks the saved Cloudflare credentials (the settings page "test" button).
+type CloudflareTester interface {
+	Verify(ctx context.Context) error
+}
+
+func (a *api) testCloudflare(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	lg := a.Bus.Logger("cloudflare")
+	t0 := time.Now()
+	if err := a.Cloudflare.Verify(ctx); err != nil {
+		lg.Warn("verify_failed", 0, "Cloudflare 凭据校验失败:"+err.Error(), map[string]any{"duration_ms": time.Since(t0), "error": err.Error()})
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	lg.Info("verify_ok", 0, "Cloudflare 凭据校验通过", map[string]any{"duration_ms": time.Since(t0)})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (a *api) testTelegram(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer cancel()

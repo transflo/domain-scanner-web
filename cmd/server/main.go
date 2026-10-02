@@ -11,17 +11,22 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
+	"domain_scanner/internal/appsettings"
 	"domain_scanner/internal/auth"
+	"domain_scanner/internal/cloudflare"
 	"domain_scanner/internal/egress"
 	"domain_scanner/internal/logbus"
 	"domain_scanner/internal/notifier"
 	"domain_scanner/internal/proxy"
+	"domain_scanner/internal/register"
 	"domain_scanner/internal/scheduler"
 	"domain_scanner/internal/server"
 	"domain_scanner/internal/store"
+	"domain_scanner/internal/verify"
 	"domain_scanner/internal/wordlists"
 )
 
@@ -84,15 +89,37 @@ func run(cfg *Config) error {
 	sys := bus.Logger("system")
 
 	envTG := notifier.Config{Token: cfg.TelegramToken, ChatID: cfg.TelegramChatID}
-	nf := notifier.New(server.TelegramConfigFunc(st, envTG), bus, notifier.Options{})
+	envCF := appsettings.Cloudflare{AccountID: cfg.CFAccountID, Token: cfg.CFToken}
+	// secrets known at startup must never be printed, whatever component logs them
+	bus.SetSecrets(envTG.Token, envCF.Token, cfg.AdminPassword)
+
+	// Telegram: pushes plus the long-poll for register-button presses. The update offset is
+	// persisted so a press handled before a restart is never replayed.
+	const offsetKey = "telegram_update_offset"
+	nf := notifier.New(server.TelegramConfigFunc(st, envTG), bus, notifier.Options{
+		LoadOffset: func() int64 {
+			v, _, _ := st.GetSetting(context.Background(), offsetKey)
+			n, _ := strconv.ParseInt(v, 10, 64)
+			return n
+		},
+		SaveOffset: func(n int64) { _ = st.SetSetting(context.Background(), offsetKey, strconv.FormatInt(n, 10)) },
+	})
 	rootCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	nf.Start(rootCtx)
 
+	// Cloudflare registrar: the final check before announcing, and the registration behind the button.
+	policy := appsettings.RegisterPolicyFunc(st)
+	cf := cloudflare.New(appsettings.CloudflareFunc(st, envCF))
+	verifier := &verify.Verifier{St: st, CF: cf, Sink: nf, Policy: policy, Log: bus.Logger("cloudflare")}
+	verifier.Start(rootCtx)
+	registrar := &register.Service{St: st, CF: cf, Policy: policy, Log: bus.Logger("register")}
+	nf.StartCallbacks(rootCtx, registrar)
+
 	words := wordlists.NewManager(cfg.WordlistDir, filepath.Join(cfg.DataDir, "wordlists"))
 	reg := egress.NewRegistry()
 	checkers := newCheckerPool(reg, cfg.RDAPServers, func(format string, args ...any) { bus.Log("warn", 0, format, args...) })
-	sched := scheduler.New(st, bus, nf, checkers, words,
+	sched := scheduler.New(st, bus, verifier, checkers, words,
 		scheduler.Options{MaxParallelJobs: cfg.MaxParallelJobs, Registry: reg})
 	if err := sched.Start(ctx); err != nil {
 		return fmt.Errorf("恢复任务: %w", err)
@@ -109,8 +136,8 @@ func run(cfg *Config) error {
 	go psvc.Run(rootCtx)
 
 	handler := server.New(server.Deps{
-		Store: st, Bus: bus, Sched: sched, Words: words, Telegram: nf, Auth: authn, Proxy: psvc,
-		TelegramEnv: envTG, MaxWordlistBytes: maxWordlistBytes, TrustProxy: cfg.TrustProxy,
+		Store: st, Bus: bus, Sched: sched, Words: words, Telegram: nf, Auth: authn, Proxy: psvc, Cloudflare: cf,
+		TelegramEnv: envTG, CloudflareEnv: envCF, MaxWordlistBytes: maxWordlistBytes, TrustProxy: cfg.TrustProxy,
 	})
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 
@@ -146,6 +173,7 @@ func run(cfg *Config) error {
 	_ = srv.Shutdown(shutCtx)
 	sched.Shutdown(shutCtx)
 	mgr.Stop()
+	verifier.Stop() // flush hits still waiting for their Cloudflare check
 	nf.Stop()
 	return nil
 }

@@ -345,15 +345,15 @@ func (s *Scheduler) record(job *store.Job, e event) counters {
 	switch v.Status {
 	case domain.StatusAvailable:
 		d.available = 1
-		inserted, err := s.st.InsertResult(ctx, &store.Result{JobID: job.ID, Domain: v.Domain, Status: "available",
-			Signatures: strings.Join(v.Signatures, ",")})
+		res := &store.Result{JobID: job.ID, Domain: v.Domain, Status: "available", Signatures: strings.Join(v.Signatures, ",")}
+		inserted, err := s.st.InsertResult(ctx, res)
 		if err != nil {
 			s.cl.Error("save_failed", job.ID, fmt.Sprintf("保存结果 %s 失败:%v", v.Domain, err), logbus.Fields{"domain": v.Domain, "error": err.Error()})
 			break
 		}
 		if inserted {
 			s.cl.Info("found", job.ID, fmt.Sprintf("可注册:%s", v.Domain), logbus.Fields{"domain": v.Domain, "egress": e.egress, "reason": v.Reason})
-			s.nf.Notify(job.Name, []string{v.Domain})
+			s.nf.Found(Hit{ResultID: res.ID, JobID: job.ID, JobName: job.Name, Domain: v.Domain})
 		} else {
 			s.cl.Debug("duplicate", job.ID, fmt.Sprintf("%s 已存在于结果中,不重复推送", v.Domain), logbus.Fields{"domain": v.Domain})
 		}

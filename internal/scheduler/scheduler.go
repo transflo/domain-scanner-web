@@ -37,8 +37,18 @@ type Checker interface {
 	Check(ctx context.Context, domain string, o CheckOpts) domain.Verdict
 }
 
+// Hit is a domain the scan found to be available, handed to whatever verifies and announces it.
+type Hit struct {
+	ResultID int64 // id of the stored result row
+	JobID    int64
+	JobName  string
+	Domain   string
+}
+
+// Notifier receives every newly found available domain. The production implementation is the
+// Cloudflare verifier, which announces the domain once it has been checked.
 type Notifier interface {
-	Notify(job string, domains []string)
+	Found(h Hit)
 }
 
 type Words interface {

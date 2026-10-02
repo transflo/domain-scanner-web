@@ -20,6 +20,8 @@ type Config struct {
 	RDAPServers     map[string]string // extra TLD -> RDAP base URL (RDAP_SERVERS)
 	XrayBin         string            // path of the xray-core binary (XRAY_BIN)
 	LogStdoutLevel  string            // lowest level printed to stdout (LOG_STDOUT_LEVEL); the DB keeps more
+	CFAccountID     string            // CLOUDFLARE_ACCOUNT_ID (the settings page overrides it)
+	CFToken         string            // CLOUDFLARE_API_TOKEN
 }
 
 const minPasswordLen = 8
@@ -39,6 +41,8 @@ func LoadConfig(getenv func(string) string) (*Config, error) {
 		WordlistDir:    or("WORDLIST_DIR", "/app/wordlists"),
 		XrayBin:        or("XRAY_BIN", "/usr/local/bin/xray"),
 		LogStdoutLevel: strings.ToLower(or("LOG_STDOUT_LEVEL", "info")),
+		CFAccountID:    strings.TrimSpace(getenv("CLOUDFLARE_ACCOUNT_ID")),
+		CFToken:        strings.TrimSpace(getenv("CLOUDFLARE_API_TOKEN")),
 		AdminPassword:  getenv("ADMIN_PASSWORD"),
 		TelegramToken:  strings.TrimSpace(getenv("TELEGRAM_BOT_TOKEN")),
 		TelegramChatID: strings.TrimSpace(getenv("TELEGRAM_CHAT_ID")),

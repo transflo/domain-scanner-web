@@ -32,17 +32,17 @@ func (a *api) login(w http.ResponseWriter, r *http.Request) {
 	value, err := a.Auth.Login(ip, body.Password)
 	switch {
 	case errors.Is(err, auth.ErrLocked):
-		a.Bus.Log("warn", 0, "登录被锁定(来源 %s):失败次数过多", ip)
+		a.Bus.Logger("auth").Warn("locked", 0, fmt.Sprintf("登录被锁定(来源 %s):失败次数过多", ip), map[string]any{"ip": ip})
 		w.Header().Set("Retry-After", "300")
 		writeErr(w, http.StatusTooManyRequests, "失败次数过多,请 5 分钟后再试")
 	case errors.Is(err, auth.ErrBadPassword):
-		a.Bus.Log("warn", 0, "登录失败(来源 %s)", ip)
+		a.Bus.Logger("auth").Warn("login_failed", 0, fmt.Sprintf("登录失败(来源 %s)", ip), map[string]any{"ip": ip})
 		writeErr(w, http.StatusUnauthorized, "口令错误")
 	case err != nil:
 		a.fail(w, err)
 	default:
 		a.Auth.SetCookie(w, r, value)
-		a.Bus.Log("info", 0, "登录成功(来源 %s)", ip)
+		a.Bus.Logger("auth").Info("login_ok", 0, fmt.Sprintf("登录成功(来源 %s)", ip), map[string]any{"ip": ip})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}
 }
@@ -155,7 +155,8 @@ func (a *api) deleteJob(w http.ResponseWriter, r *http.Request) {
 func resultFilter(r *http.Request) store.ResultFilter {
 	return store.ResultFilter{
 		JobID: int64Query(r, "job_id"), Status: r.URL.Query().Get("status"), Q: r.URL.Query().Get("q"),
-		Limit: intQuery(r, "limit"), Offset: intQuery(r, "offset"),
+		CFStatus: r.URL.Query().Get("cf_status"),
+		Limit:    intQuery(r, "limit"), Offset: intQuery(r, "offset"),
 	}
 }
 
@@ -182,16 +183,21 @@ func (a *api) exportResults(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="domains.csv"`)
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"domain", "status", "job_id", "signatures", "found_at"})
+	_ = cw.Write([]string{"domain", "status", "job_id", "signatures", "found_at", "cloudflare", "price", "currency", "registration"})
 	for {
 		items, total, err := a.Store.ListResults(r.Context(), f)
 		if err != nil {
-			a.Bus.Log("error", 0, "导出 CSV 失败:%v", err)
+			a.Bus.Logger("http").Error("export_failed", 0, fmt.Sprintf("导出 CSV 失败:%v", err), nil)
 			break
 		}
 		for _, it := range items {
+			cf := it.CFStatus
+			if it.CFReason != "" {
+				cf += ":" + it.CFReason
+			}
 			_ = cw.Write([]string{csvSafe(it.Domain), it.Status, strconv.FormatInt(it.JobID, 10),
-				csvSafe(it.Signatures), it.CreatedAt.UTC().Format(time.RFC3339)})
+				csvSafe(it.Signatures), it.CreatedAt.UTC().Format(time.RFC3339), csvSafe(cf), it.CFPrice, it.CFCurrency,
+				csvSafe(it.RegisterStatus)})
 		}
 		f.Offset += len(items)
 		if len(items) == 0 || int64(f.Offset) >= total {
@@ -241,7 +247,7 @@ func (a *api) uploadWordlist(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	a.Bus.Log("info", 0, "上传词库 %s(%d 个词)", info.ID, info.Count)
+	a.Bus.Logger("wordlist").Info("uploaded", 0, fmt.Sprintf("上传词库 %s(%d 个词)", info.ID, info.Count), map[string]any{"id": info.ID, "words": info.Count})
 	writeJSON(w, http.StatusCreated, info)
 }
 
@@ -286,8 +292,31 @@ func (a *api) exportLogs(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	err := a.Store.EachLog(r.Context(), f, func(e store.LogEntry) error { return enc.Encode(e) })
 	if err != nil {
-		a.Bus.Log("error", 0, "导出日志失败:%v", err)
+		a.Bus.Logger("http").Error("export_failed", 0, fmt.Sprintf("导出日志失败:%v", err), nil)
 	}
+}
+
+func (a *api) diagnostics(w http.ResponseWriter, r *http.Request) {
+	hours := intQuery(r, "hours")
+	if hours < 1 || hours > 720 {
+		hours = 24
+	}
+	d, err := a.Store.Diagnostics(r.Context(), time.Now().Add(-time.Duration(hours)*time.Hour))
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	count, oldest, newest, err := a.Store.LogRange(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"hours":       hours,
+		"diagnostics": d,
+		"logs":        map[string]any{"count": count, "oldest": oldest, "newest": newest},
+		"egresses":    a.Proxy.Status().Egresses,
+	})
 }
 
 func (a *api) logComponents(w http.ResponseWriter, r *http.Request) {
