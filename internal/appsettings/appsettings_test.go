@@ -41,8 +41,8 @@ func TestRegisterPolicyDefaultsAndOverrides(t *testing.T) {
 	ctx := context.Background()
 	get := RegisterPolicyFunc(st)
 	p := get()
-	if !p.Confirm || p.MaxPrice != 30 || p.DailyCap != 5 || !p.PushUnconfirmed {
-		t.Fatalf("defaults = %+v (want confirm on, 30 USD, 5/day, push unconfirmed)", p)
+	if !p.Confirm || p.MaxPrice != 0 || p.DailyCap != 0 || !p.PushUnconfirmed {
+		t.Fatalf("defaults = %+v (want confirm on, no price cap, no daily cap, push unconfirmed)", p)
 	}
 	st.SetSetting(ctx, KeyRegisterConfirm, "false")
 	st.SetSetting(ctx, KeyRegisterMaxPrice, "12.5")
@@ -53,7 +53,7 @@ func TestRegisterPolicyDefaultsAndOverrides(t *testing.T) {
 		t.Fatalf("overrides = %+v", p)
 	}
 	st.SetSetting(ctx, KeyRegisterMaxPrice, "garbage")
-	if p = get(); p.MaxPrice != 30 {
+	if p = get(); p.MaxPrice != 0 {
 		t.Fatalf("an unparsable price must fall back to the default, got %v", p.MaxPrice)
 	}
 }

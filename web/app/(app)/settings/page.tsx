@@ -236,7 +236,7 @@ export default function SettingsPage() {
             <CardHeader>
               <CardTitle>一键注册策略</CardTitle>
               <CardDescription>
-                注册会真实扣费且不可退款。点按钮后默认再确认一次;超过价格上限或当日次数上限时会拒绝。
+                注册会真实扣费且不可退款。点按钮后默认再确认一次;价格上限和每日上限默认都不限制,需要时可在下面自行设置。
               </CardDescription>
             </CardHeader>
             <CardContent className="mt-4 flex flex-col gap-4">

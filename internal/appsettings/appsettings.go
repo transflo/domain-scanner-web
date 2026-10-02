@@ -31,8 +31,8 @@ const (
 const (
 	DefaultLogLevel     = "debug"
 	DefaultProxyTestURL = "https://cp.cloudflare.com/generate_204"
-	defaultMaxPrice     = 30.0
-	defaultDailyCap     = 5
+	defaultMaxPrice     = 0.0 // no price cap unless the user sets one
+	defaultDailyCap     = 0   // no daily cap unless the user sets one
 )
 
 func get(st *store.Store, key string) (string, bool) {

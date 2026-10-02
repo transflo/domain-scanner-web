@@ -7,7 +7,7 @@
 - **后台挂起**:任务在服务端运行,关页面不受影响;容器重启后未完成的任务**自动从断点续跑**(游标与计数一起持久化,不重复计数)
 - **多数据源检测**:DNS → **RDAP**(IANA bootstrap + 内置已验证的 ccTLD 服务器)→ WHOIS 兜底 → TLS 证书交叉验证;**不确定就是 unknown,绝不会误报成可注册**
 - **Cloudflare 最终核查**:检测命中后用 Registrar `domain-check` 确认「真的能注册」及价格;不可注册的(保留名、溢价、已被占用)不推送
-- **一键注册**:Telegram 消息带「注册」按钮 → 看到域名和价格 → 再点「确认注册」才扣费;有单价上限和每日上限
+- **一键注册**:Telegram 消息带「注册」按钮 → 看到域名和价格 → 再点「确认注册」才扣费;单价上限和每日上限可选(默认不限制)
 - **出站代理(Xray)**:内置 Xray 内核,支持 VLESS / VMess / Trojan / Shadowsocks / SOCKS / HTTP;可用表单、JSON 或分享链接/订阅导入,支持测活;**每个任务可单独选择出站**(直连 / 指定代理 / 代理池)
 - **直连不限并发,出错自动退避并切换**:直连任务数量不设上限;检测到大量错误(限流、超时、断连)时主动退避,并切换到测活通过的代理,恢复后自动切回
 - **详细日志**:每个检查步骤(DNS、RDAP、WHOIS、TLS、出站切换、Cloudflare、Telegram)都有结构化日志,可按组件/域名/出站/关键字过滤,导出 JSONL,「诊断统计」按出站和后缀汇总失败原因,便于运行一段时间后迭代
@@ -60,7 +60,7 @@ docker compose up -d --build
    - **Cloudflare 不支持的后缀**(如 `.li` `.ch` `.sh` `.cc`)→ 仍推送(可在设置里关闭),标注「未经 Cloudflare 确认」,**不带注册按钮**;
    - Cloudflare 暂时出错 → 按「未经确认」处理,不带按钮。
 3. 点「注册」→ 机器人回复域名与价格 → 再点「确认注册」才会真正调用 `POST /accounts/{id}/registrar/registrations`。**这一步会真实扣费且不可退款。** 可在设置里关闭二次确认(不推荐)。
-4. 保护措施:单价上限(默认 30 美元)、每日注册上限(默认 5 个);数据库层面的原子占位保证同一个域名不会被重复扣费;确认按钮 15 分钟后失效;只接受来自你配置的私聊的按钮点击。
+4. 保护措施:单价上限和每日注册上限默认不限制,可在设置里自行开启;数据库层面的原子占位保证同一个域名不会被重复扣费;确认按钮 15 分钟后失效;只接受来自你配置的私聊的按钮点击。
 5. 只有**私聊**(数字 Chat ID)才会出现按钮;频道/群组只收通知。
 
 ### 出站代理(Xray)
@@ -111,7 +111,7 @@ docker compose up -d --build
 - 连续输错 5 次,按来源 IP 锁定 5 分钟。
 - scanner 的 8080 端口**不映射到宿主机**,只能经 web 容器访问。
 - Telegram token、Cloudflare token 不会出现在日志和 API 响应里(只返回脱敏值)。
-- **Cloudflare Token 能花钱**:请只授予 Registrar 权限,并设好单价/每日上限;如果 Token 或 Bot Token 曾经出现在聊天记录、截图或终端里,请到 Cloudflare / @BotFather 轮换。
+- **Cloudflare Token 能花钱**:请只授予 Registrar 权限,并按需在设置里开启单价/每日上限;如果 Token 或 Bot Token 曾经出现在聊天记录、截图或终端里,请到 Cloudflare / @BotFather 轮换。
 - 若放在公网,请务必套 HTTPS 反向代理(代理需传 `X-Forwarded-Proto: https`,cookie 会自动带 `Secure`)。
 
 ## 开发
@@ -174,7 +174,7 @@ web/                 Next.js + shadcn/ui(b0);web/e2e 为多设备测试
 
 - **大量 unknown**:到「运行日志」看原因,或看「诊断统计」。`HTTP 429` 表示被注册局限流(会自动退避);`whois ... not permitted` 表示该注册局拒绝 WHOIS,请确认该 TLD 有 RDAP(可用 `RDAP_SERVERS` 补充)。
 - **Telegram 报 `chat not found`**:先在 Telegram 里对机器人点 Start,并核对 Chat ID。
-- **没有出现「注册」按钮**:确认 Cloudflare 已配置、该后缀被 Cloudflare 支持、Chat ID 是私聊的数字 ID,且价格没超过上限。
+- **没有出现「注册」按钮**:确认 Cloudflare 已配置、该后缀被 Cloudflare 支持、Chat ID 是私聊的数字 ID,且价格没超过你设置的上限(如果设了)。
 - **代理显示不可用**:列表里会显示 Xray 或探测给出的原因(DNS 解析失败、连接被拒、握手失败等);先「测活」,再检查 JSON。
 - **想让容器日志也能看**:`docker compose logs -f scanner`,和日志页内容一致。
 
