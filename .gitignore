@@ -1,0 +1,14 @@
+.superpowers/
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+bin/
+node_modules/
+.next/
+web/.next/
+web/node_modules/
+*.log
+available_domains_*.txt
+registered_domains_*.txt

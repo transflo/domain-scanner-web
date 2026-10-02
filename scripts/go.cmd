@@ -1,0 +1,3 @@
+@echo off
+REM Run go inside docker (no local Go install). Usage: go.cmd test ./...
+docker run --rm -v "%CD%:/src" -v gomod:/go/pkg/mod -v gobuild:/root/.cache/go-build -w /src golang:1.25 go %*
