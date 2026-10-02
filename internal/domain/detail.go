@@ -154,6 +154,12 @@ func (c *Checker) Check(ctx context.Context, domain string) Verdict {
 				v.Status, v.Reason = StatusAvailable, "RDAP: registry has no such domain"
 			}
 			return v
+		case RDAPRateLimited:
+			v.Status, v.Reason = StatusUnknown, "RDAP rate limited (HTTP 429)"
+			if err != nil {
+				v.Reason = err.Error()
+			}
+			return v
 		case RDAPError:
 			if err != nil {
 				rdapNote = err.Error()

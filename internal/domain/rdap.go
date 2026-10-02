@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,8 +22,16 @@ const (
 	RDAPFound
 	// RDAPNotFound: the registry answered 404 — the domain is not registered.
 	RDAPNotFound
-	// RDAPError: no usable answer (rate limit, 5xx, network); callers must fall back or give up.
+	// RDAPError: no usable answer (5xx, network); callers may fall back to WHOIS.
 	RDAPError
+	// RDAPRateLimited: the server kept answering 429. Another protocol will not help, so callers
+	// should report "unknown" instead of falling back.
+	RDAPRateLimited
+)
+
+const (
+	maxRateLimitRetries = 2
+	maxRetryAfter       = 10 * time.Second
 )
 
 const (
@@ -40,10 +49,18 @@ type RDAPClient struct {
 	// Overrides maps a TLD to an RDAP base URL (ending in "/") and wins over the IANA bootstrap.
 	// Many ccTLDs run RDAP but are not in the bootstrap file, so a verified list is built in.
 	Overrides map[string]string
+	// MinInterval is the minimum spacing between requests to the same RDAP server, shared by all
+	// workers, so a burst of parallel scans does not trip the registry's rate limit.
+	MinInterval time.Duration
+	// RetryDelay is used after a 429 that carries no usable Retry-After header.
+	RetryDelay time.Duration
 
 	mu      sync.Mutex
 	servers map[string]string
 	fetched time.Time
+
+	limMu sync.Mutex
+	next  map[string]time.Time
 }
 
 // defaultRDAPServers are ccTLD/gTLD RDAP endpoints that are absent from the IANA bootstrap
@@ -74,7 +91,54 @@ func NewRDAPClient() *RDAPClient {
 		BootstrapURL: defaultBootstrapURL,
 		BootstrapTTL: 24 * time.Hour,
 		Overrides:    overrides,
+		MinInterval:  250 * time.Millisecond,
+		RetryDelay:   2 * time.Second,
+		next:         map[string]time.Time{},
 	}
+}
+
+// waitTurn blocks until this client may send the next request to base.
+func (c *RDAPClient) waitTurn(ctx context.Context, base string) error {
+	if c.MinInterval <= 0 {
+		return nil
+	}
+	c.limMu.Lock()
+	if c.next == nil {
+		c.next = map[string]time.Time{}
+	}
+	at := c.next[base]
+	if now := time.Now(); at.Before(now) {
+		at = now
+	}
+	c.next[base] = at.Add(c.MinInterval)
+	c.limMu.Unlock()
+	return sleepCtx(ctx, time.Until(at))
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// retryDelay honours a numeric Retry-After header (capped), else the configured default.
+func (c *RDAPClient) retryDelay(h http.Header) time.Duration {
+	if s, err := strconv.Atoi(strings.TrimSpace(h.Get("Retry-After"))); err == nil && s >= 0 {
+		d := time.Duration(s) * time.Second
+		if d > maxRetryAfter {
+			d = maxRetryAfter
+		}
+		return d
+	}
+	return c.RetryDelay
 }
 
 // Lookup asks the TLD's RDAP server about domain.
@@ -96,26 +160,38 @@ func (c *RDAPClient) Lookup(ctx context.Context, domain string) (RDAPResult, err
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"domain/"+domain, nil)
-	if err != nil {
-		return RDAPError, err
-	}
-	req.Header.Set("Accept", "application/rdap+json")
-	req.Header.Set("User-Agent", rdapUserAgent)
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return RDAPError, fmt.Errorf("rdap request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	for attempt := 0; ; attempt++ {
+		if err := c.waitTurn(ctx, base); err != nil {
+			return RDAPError, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"domain/"+domain, nil)
+		if err != nil {
+			return RDAPError, err
+		}
+		req.Header.Set("Accept", "application/rdap+json")
+		req.Header.Set("User-Agent", rdapUserAgent)
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return RDAPError, fmt.Errorf("rdap request failed: %w", err)
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-		return RDAPFound, nil
-	case http.StatusNotFound:
-		return RDAPNotFound, nil
-	default:
-		return RDAPError, fmt.Errorf("rdap %s: HTTP %d", base, resp.StatusCode)
+		switch resp.StatusCode {
+		case http.StatusOK:
+			return RDAPFound, nil
+		case http.StatusNotFound:
+			return RDAPNotFound, nil
+		case http.StatusTooManyRequests:
+			if attempt >= maxRateLimitRetries {
+				return RDAPRateLimited, fmt.Errorf("rdap %s: HTTP 429 (rate limited)", base)
+			}
+			if err := sleepCtx(ctx, c.retryDelay(resp.Header)); err != nil {
+				return RDAPError, err
+			}
+		default:
+			return RDAPError, fmt.Errorf("rdap %s: HTTP %d", base, resp.StatusCode)
+		}
 	}
 }
 

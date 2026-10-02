@@ -128,6 +128,7 @@ func newRDAPFixture(t *testing.T) *rdapFixture {
 	mux.HandleFunc("/rdap-com/domain/", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) })
 	f.client = NewRDAPClient()
 	f.client.Overrides = map[string]string{} // tests must not touch the real servers
+	f.client.RetryDelay = time.Millisecond
 	f.client.BootstrapURL = f.srv.URL + "/bootstrap.json"
 	return f
 }
@@ -143,7 +144,7 @@ func TestRDAPClientClassifiesResponses(t *testing.T) {
 		{"taken.li", RDAPFound, false},
 		{"free.li", RDAPNotFound, false},
 		{"FREE.LI", RDAPNotFound, false},         // case-insensitive
-		{"limited.li", RDAPError, true},          // 429
+		{"limited.li", RDAPRateLimited, true},    // 429
 		{"broken.li", RDAPError, true},           // 5xx
 		{"weird.li", RDAPError, true},            // 400
 		{"anything.com", RDAPNotFound, false},    // second bootstrap entry, URL without trailing slash
@@ -183,6 +184,79 @@ func TestRDAPOverridesWinAndSkipBootstrap(t *testing.T) {
 	f.client.Overrides["com"] = f.srv.URL + "/rdap-ch/"
 	if got, _ := f.client.Lookup(context.Background(), "taken.com"); got != RDAPFound {
 		t.Fatalf("override should take precedence over bootstrap, got %v", got)
+	}
+}
+
+// rateLimitFixture serves RDAP for one TLD and answers 429 for the first `limited` requests.
+func rateLimitFixture(t *testing.T, limited int32, retryAfter string) (*RDAPClient, *atomic.Int32) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) <= limited {
+			if retryAfter != "" {
+				w.Header().Set("Retry-After", retryAfter)
+			}
+			w.WriteHeader(429)
+			return
+		}
+		fmt.Fprint(w, `{"objectClassName":"domain"}`)
+	}))
+	t.Cleanup(srv.Close)
+	c := NewRDAPClient()
+	c.Overrides = map[string]string{"li": srv.URL + "/"}
+	c.RetryDelay = 5 * time.Millisecond
+	return c, &hits
+}
+
+func TestRDAPClientRetriesAfter429(t *testing.T) {
+	c, hits := rateLimitFixture(t, 1, "0")
+	got, err := c.Lookup(context.Background(), "taken.li")
+	if got != RDAPFound || err != nil {
+		t.Fatalf("got %v, %v; want Found after one retry", got, err)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("requests = %d, want 2", hits.Load())
+	}
+}
+
+func TestRDAPClientGivesUpWithRateLimitedResult(t *testing.T) {
+	c, hits := rateLimitFixture(t, 100, "")
+	got, err := c.Lookup(context.Background(), "taken.li")
+	if got != RDAPRateLimited || err == nil {
+		t.Fatalf("got %v, %v; want RDAPRateLimited with an error", got, err)
+	}
+	if hits.Load() != 3 {
+		t.Fatalf("requests = %d, want 3 (1 try + 2 retries)", hits.Load())
+	}
+}
+
+func TestRDAPClientSpacesRequestsPerServer(t *testing.T) {
+	c, _ := rateLimitFixture(t, 0, "")
+	c.MinInterval = 40 * time.Millisecond
+	start := time.Now()
+	done := make(chan struct{}, 5)
+	for i := 0; i < 5; i++ {
+		go func() { c.Lookup(context.Background(), "taken.li"); done <- struct{}{} }()
+	}
+	for i := 0; i < 5; i++ {
+		<-done
+	}
+	if el := time.Since(start); el < 4*40*time.Millisecond {
+		t.Fatalf("5 concurrent lookups finished in %v, want >= 160ms of spacing", el)
+	}
+}
+
+func TestCheckerRDAPRateLimitedIsUnknownWithoutWhois(t *testing.T) {
+	f := &fakeNet{whois: whoisReturns(`No match for "X.LI"`)}
+	c := f.checker()
+	c.RDAP = func(context.Context, string) (RDAPResult, error) {
+		return RDAPRateLimited, errors.New("rdap: HTTP 429")
+	}
+	v := c.Check(context.Background(), "x.li")
+	if v.Status != StatusUnknown || !strings.Contains(v.Reason, "429") {
+		t.Fatalf("got %s %q, want unknown mentioning the rate limit", v.Status, v.Reason)
+	}
+	if f.whoisCall != 0 {
+		t.Fatalf("whois consulted after an RDAP rate limit (%d calls); it cannot give a better answer", f.whoisCall)
 	}
 }
 
