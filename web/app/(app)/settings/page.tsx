@@ -118,7 +118,7 @@ export default function SettingsPage() {
                     id="tg-chat"
                     inputMode="numeric"
                     autoComplete="off"
-                    placeholder="例如 <CHAT_ID> 或 @channel"
+                    placeholder="例如 123456789 或 @channel"
                     value={chatId ?? s?.telegram_chat_id ?? ""}
                     onChange={(e) => setChatId(e.target.value)}
                   />

@@ -12,3 +12,7 @@ web/node_modules/
 *.log
 available_domains_*.txt
 registered_domains_*.txt
+
+# local tooling output
+.playwright-mcp/
+/*.png
